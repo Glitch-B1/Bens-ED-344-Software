@@ -27,7 +27,6 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import re
-from typing import Optional, Tuple, List
 
 
 # ------------------------------------------------ Block 1 : End ------------------------------------------------#
@@ -105,14 +104,18 @@ _UNIT_SCALE = {
 
 
 def _read_text_head(path: str, max_lines: int = 400) -> List[str]:
+    """Read up to max_lines from file; if max_lines is None or <=0, read entire file."""
+    lines: List[str] = []
     with open(path, "r", encoding="utf-8", errors="replace") as f:
-        lines = []
+        if max_lines is None or max_lines <= 0:
+            for line in f:
+                lines.append(line.rstrip("\n\r"))
+            return lines
         for i, line in enumerate(f):
-            lines.append(line.rstrip("\n\r"))
-            if i >= max_lines:
+            if i >= max_lines:   # stop BEFORE appending the (max_lines+1)-th line
                 break
+            lines.append(line.rstrip("\n\r"))
     return lines
-
 
 def _sniff_delimiter_and_decimal(lines: List[str]) -> Tuple[str, str]:
     """
@@ -233,7 +236,7 @@ def _find_data_start_and_headers(lines: List[str], delim: str) -> Tuple[int, Opt
 
 def load_scope_csv_robust(path: str) -> Optional[StandardSignal]:
     try:
-        lines = _read_text_head(path, 1000)
+        lines = _read_text_head(path, max_lines=None)   # was 1000
         if not lines:
             raise ValueError("Empty file")
 
@@ -773,6 +776,15 @@ def draw_stats(surf, x, y, metrics: AnalysisMetrics, font, font_small):
         line(skew_txt, MUTED)
     else:
         line(skew_txt + f"{metrics.triangle_skew_percent:.1f} %", col)
+
+
+def draw_titled_panel(surf, rect: pygame.Rect, title: str, font):
+    """Draw a rounded panel with a section title."""
+    pygame.draw.rect(surf, (22, 25, 35), rect, border_radius=10)
+    pygame.draw.rect(surf, (70, 75, 90), rect, width=2, border_radius=10)
+    surf.blit(font.render(title, True, TEXT), (rect.x + 10, rect.y + 8))
+
+
 # --------------------------------------- Block 8 : End ------------------------------------------#
 
 
@@ -806,35 +818,79 @@ class App:
         # Audio
         self.audio = AudioStream(SAMPLE_RATE, 1)
 
-        # UI
-        self.buttons: List[Button] = []
+        # UI layout
+        self.PAD = 16
+        self.SIDEBAR_W = 280
+        self._layout()
+
+        # UI widgets
+        self.buttons: List["Button"] = []
         self._build_ui()
+
+    def _layout(self):
+        """Compute static rectangles for the left sidebar and right plots."""
+        PAD = self.PAD
+        self.sidebar = pygame.Rect(PAD, PAD, self.SIDEBAR_W, HEIGHT - 2 * PAD)
+
+        # Panel heights (tuned to your sketch)
+        load_h = 160
+        select_h = 190
+        cal_h = 72
+
+        # Panels (top→bottom); leave remaining space for Statistics
+        self.panel_load = pygame.Rect(self.sidebar.x, self.sidebar.y, self.sidebar.w, load_h)
+        self.panel_select = pygame.Rect(self.sidebar.x, self.panel_load.bottom + PAD, self.sidebar.w, select_h)
+        self.panel_cal = pygame.Rect(self.sidebar.x, self.sidebar.bottom - cal_h, self.sidebar.w, cal_h)
+        self.panel_stats = pygame.Rect(self.sidebar.x, self.panel_select.bottom + PAD,
+                                       self.sidebar.w, self.panel_cal.y - (self.panel_select.bottom + PAD))
+
+        # Right side plots (split view)
+        right_x = self.sidebar.right + PAD
+        content_w = WIDTH - right_x - PAD
+        plot_h = (HEIGHT - 2 * PAD - MID_GAP) // 2
+        self.plot_time = pygame.Rect(right_x, PAD, content_w, plot_h)
+        self.plot_fft = pygame.Rect(right_x, PAD + plot_h + MID_GAP, content_w, plot_h)
 
     # ---------- UI ----------
 
     def _build_ui(self):
-        x, y, w, h = 16, 16, 130, 36
+        PAD = 12
+        bw, bh = self.panel_load.w - 2 * PAD, 34
 
-        def add(label, cb, toggle=False):
-            nonlocal x  # <-- fix: declare before first use/assignment
-            btn = Button((x, y, w, h), label, cb, toggle=toggle)
+        # --- Load signal panel ---
+        x = self.panel_load.x + PAD
+        y = self.panel_load.y + 36  # leave space for the title
+
+        def add_here(label, cb, toggle=False):
+            nonlocal y
+            btn = Button((x, y, bw, bh), label, cb, toggle=toggle)
             self.buttons.append(btn)
-            x += w + 10
+            y += bh + 8
             return btn
 
-        add("Load Signal", self.on_load_csv)
-        self.btn_live = add("Live Capture", self.on_toggle_live, toggle=True)
+        add_here("Choose file", self.on_load_csv)
+        self.btn_live = add_here("Live capture", self.on_toggle_live, toggle=True)
         self.btn_live.active = False
 
-        x += 20
-        add("Auto (Cal)", self.on_auto_cal)
-
-        x += 20
-        self.btn_auto = add("Auto", lambda b: self.set_mode("auto"), toggle=True)
-        self.btn_sine = add("Sine", lambda b: self.set_mode("sine"), toggle=True)
-        self.btn_square = add("Square", lambda b: self.set_mode("square"), toggle=True)
-        self.btn_triangle = add("Triangle", lambda b: self.set_mode("triangle"), toggle=True)
+        # --- Signal select panel (vertical buttons) ---
+        x = self.panel_select.x + PAD
+        y = self.panel_select.y + 36
+        bw = self.panel_select.w - 2 * PAD
+        self.btn_square = Button((x, y, bw, bh), "Square", lambda b: self.set_mode("square"), toggle=True);
+        y += bh + 8
+        self.btn_triangle = Button((x, y, bw, bh), "Triangle", lambda b: self.set_mode("triangle"), toggle=True);
+        y += bh + 8
+        self.btn_sine = Button((x, y, bw, bh), "Sine", lambda b: self.set_mode("sine"), toggle=True);
+        y += bh + 8
+        self.btn_auto = Button((x, y, bw, bh), "Auto", lambda b: self.set_mode("auto"), toggle=True)
+        self.buttons += [self.btn_square, self.btn_triangle, self.btn_sine, self.btn_auto]
         self._sync_mode_buttons()
+
+        # --- Calibration panel ---
+        x = self.panel_cal.x + PAD
+        y = self.panel_cal.y + 36
+        bw = self.panel_cal.w - 2 * PAD
+        self.buttons.append(Button((x, y, bw, bh), "Auto calibrate", self.on_auto_cal, toggle=False))
 
     def set_mode(self, m: str):
         self.mode = m
@@ -876,7 +932,8 @@ class App:
         self.current_file = os.path.basename(path)
         # Fit view to the loaded data
         plot_rect = pygame.Rect(16, TOP_PAD, WIDTH - 280 - 32, PLOT_TOP_H)
-        self.scale = auto_calibrate(self.signal, plot_rect)
+        # self.scale = auto_calibrate(self.signal, plot_rect)
+        self.scale = auto_calibrate(self.signal, self.plot_time)
         # Ensure live is off when a file is loaded
         if self.live_on:
             self.audio.stop()
@@ -906,7 +963,40 @@ class App:
         if self.signal is None:
             return
         plot_rect = pygame.Rect(16, TOP_PAD, WIDTH - 280 - 32, PLOT_TOP_H)
-        self.scale = auto_calibrate(self.signal, plot_rect)
+        # self.scale = auto_calibrate(self.signal, plot_rect)
+        self.scale = auto_calibrate(self.signal, self.plot_time)
+
+    def analyze(self, sig: StandardSignal) -> AnalysisMetrics:
+        """Compute metrics + (auto)classification for the current signal."""
+        # Always-available metrics
+        freqs, mag = compute_fft(sig)
+        f0 = estimate_fundamental(freqs, mag)
+        vpp, vrms, dc = compute_basic_levels(sig.amplitude)
+        thd = compute_thd(freqs, mag, f0)
+
+        # Auto-detect (with label) unless user forced a mode
+        label = self.detected_label
+        effective_mode = self.mode
+        if self.mode == "auto":
+            lbl, conf = classify_waveform(freqs, mag, sig.amplitude)
+            label = f"{lbl} ({conf})"
+            effective_mode = lbl.lower() if lbl in ("Sine", "Square", "Triangle") else "auto"
+
+        # Conditional metrics
+        duty = compute_duty_cycle(sig.amplitude) if effective_mode == "square" else None
+        skew = compute_triangle_skew(sig.amplitude) if effective_mode == "triangle" else None
+
+        return AnalysisMetrics(
+            f0_hz=f0,
+            thd_percent=thd,
+            vpp=vpp,
+            vrms=vrms,
+            dc=dc,
+            duty_percent=duty,
+            triangle_skew_percent=skew,
+            mode=self.mode,
+            detected_label=label
+        )
 
     # ---------- Main loop ----------
 
@@ -941,30 +1031,41 @@ class App:
                 self.detected_label = metrics.detected_label
                 last_ana = now
 
-            # Draw
+            # --- Clear ---
             self.screen.fill(BG)
-            header = f"Current file: {self.current_file if self.current_file else '—'}    Live Status: {'On' if self.live_on else 'Off'}"
-            self.screen.blit(self.font.render(header, True, TEXT), (16, 56))
 
-            left_w = WIDTH - 280 - 32
-            plot_time = pygame.Rect(16, TOP_PAD, left_w, PLOT_TOP_H)
-            plot_fft = pygame.Rect(16, BOTTOM_PAD + PLOT_TOP_H + MID_GAP, left_w, PLOT_TOP_H)
+            # --- Panels & titles ---
+            draw_titled_panel(self.screen, self.panel_load, "Load signal", self.font)
+            draw_titled_panel(self.screen, self.panel_select, "Signal select", self.font)
+            draw_titled_panel(self.screen, self.panel_stats, "Statistics", self.font)
+            draw_titled_panel(self.screen, self.panel_cal, "Calibration", self.font)
 
+            # --- Panel content: Load signal status text ---
+            sx = self.panel_load.x + 12
+            sy = self.panel_load.y + 36 + 2 * 34 + 10  # under the two buttons
+            curr = f"Current file: {self.current_file if self.current_file else '—'}"
+            stat = f"Status: {'On' if self.live_on else 'Off'}"
+            self.screen.blit(self.font_small.render(curr, True, TEXT), (sx, sy));
+            sy += 22
+            self.screen.blit(self.font_small.render(stat, True, TEXT), (sx, sy))
+
+            # --- Draw the buttons last so they sit above panel backgrounds ---
+            for b in self.buttons:
+                b.draw(self.screen, self.font_small)
+
+            # --- Right-side plots ---
             if self.signal:
-                draw_waveform(self.screen, plot_time, self.signal, self.scale, self.font_small)
+                draw_waveform(self.screen, self.plot_time, self.signal, self.scale, self.font_small)
                 freqs, mag = cached_fft
-                draw_spectrum(self.screen, plot_fft, freqs, mag, metrics.f0_hz, self.font_small)
+                draw_spectrum(self.screen, self.plot_fft, freqs, mag, metrics.f0_hz, self.font_small)
             else:
-                draw_grid(self.screen, plot_time)
-                draw_grid(self.screen, plot_fft)
+                draw_grid(self.screen, self.plot_time)
+                draw_grid(self.screen, self.plot_fft)
 
-            # Stats panel
-            panel = pygame.Rect(WIDTH - 280, TOP_PAD, 264, HEIGHT - TOP_PAD - 16)
-            pygame.draw.rect(self.screen, (22, 25, 35), panel, border_radius=10)
-            pygame.draw.rect(self.screen, (70, 75, 90), panel, width=2, border_radius=10)
-            sx, sy = panel.x + 14, panel.y + 14
-            self.screen.blit(self.font.render("Statistics", True, TEXT), (sx, sy))
-            draw_stats(self.screen, sx, sy + 32, metrics, self.font, self.font_small)
+            # --- Statistics content (inside stats panel) ---
+            stats_x = self.panel_stats.x + 12
+            stats_y = self.panel_stats.y + 36
+            draw_stats(self.screen, stats_x, stats_y, metrics, self.font, self.font_small)
 
             pygame.display.flip()
 
