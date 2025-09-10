@@ -1001,3 +1001,209 @@ def load_scope_csv_robust(path: str) -> Optional[StandardSignal]:
 
 
 
+
+
+
+
+
+
+
+
+# --- at top of file, keep if you put the loader in a separate module ---
+# from io_csv import load_scope_csv_robust
+
+class App:
+    """Main Pygame application for the digital oscilloscope."""
+    def __init__(self):
+        pygame.init()
+        pygame.display.set_caption("Digital Oscilloscope")
+        self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.SysFont("consolas", 20)
+        self.font_small = pygame.font.SysFont("consolas", 16)
+
+        # State
+        self.signal: Optional[StandardSignal] = None
+        self.scale = ViewScale(volts_per_div=1.0, secs_per_div=0.01, v_offset=0.0)
+        self.mode = "auto"  # "auto","sine","square","triangle"
+        self.detected_label = "Unknown (0%)"
+        self.current_file: Optional[str] = None
+        self.live_on = False
+
+        # Audio
+        self.audio = AudioStream(SAMPLE_RATE, 1)
+
+        # UI
+        self.buttons: list[Button] = []
+        self._build_ui()
+
+    # ---------- UI ----------
+
+    def _build_ui(self):
+        x, y, w, h = 16, 16, 130, 36
+
+        def add(label, cb, toggle=False):
+            nonlocal x  # <-- fix: declare before first use/assignment
+            btn = Button((x, y, w, h), label, cb, toggle=toggle)
+            self.buttons.append(btn)
+            x += w + 10
+            return btn
+
+        add("Load Signal", self.on_load_csv)
+        self.btn_live = add("Live Capture", self.on_toggle_live, toggle=True)
+        self.btn_live.active = False
+
+        x += 20
+        add("Auto (Cal)", self.on_auto_cal)
+
+        x += 20
+        self.btn_auto = add("Auto", lambda b: self.set_mode("auto"), toggle=True)
+        self.btn_sine = add("Sine", lambda b: self.set_mode("sine"), toggle=True)
+        self.btn_square = add("Square", lambda b: self.set_mode("square"), toggle=True)
+        self.btn_triangle = add("Triangle", lambda b: self.set_mode("triangle"), toggle=True)
+        self._sync_mode_buttons()
+
+    def set_mode(self, m: str):
+        self.mode = m
+        self._sync_mode_buttons()
+
+    def _sync_mode_buttons(self):
+        for b in (self.btn_auto, self.btn_sine, self.btn_square, self.btn_triangle):
+            b.active = False
+        {"auto": self.btn_auto, "sine": self.btn_sine,
+         "square": self.btn_square, "triangle": self.btn_triangle}[self.mode].active = True
+
+    # ---------- Actions ----------
+
+    def on_load_csv(self, _=None):
+        """Open a file dialog, load a scope CSV using the robust loader, calibrate the view."""
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askopenfilename(
+            title="Choose CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        root.update()
+        root.destroy()
+        if not path:
+            return
+
+        # Use the robust, cleaning loader
+        try:
+            sig = load_scope_csv_robust(path)
+        except NameError:
+            # If the function is in the same file (not imported)
+            sig = globals()["load_scope_csv_robust"](path)
+
+        if sig is None or len(sig.time) == 0:
+            return
+
+        self.signal = sig
+        self.current_file = os.path.basename(path)
+        # Fit view to the loaded data
+        plot_rect = pygame.Rect(16, TOP_PAD, WIDTH - 280 - 32, PLOT_TOP_H)
+        self.scale = auto_calibrate(self.signal, plot_rect)
+        # Ensure live is off when a file is loaded
+        if self.live_on:
+            self.audio.stop()
+            self.live_on = False
+            if hasattr(self, "btn_live"):
+                self.btn_live.active = False
+
+    def on_toggle_live(self, btn: Button):
+        if not HAVE_SD:
+            messagebox.showwarning("Audio", "sounddevice not installed; live capture disabled.")
+            btn.active = False
+            return
+        if btn.active:
+            # Start live capture
+            try:
+                self.audio.start()
+                self.live_on = True
+                self.current_file = None
+            except Exception as e:
+                messagebox.showerror("Audio Error", str(e))
+                btn.active = False
+        else:
+            self.audio.stop()
+            self.live_on = False
+
+    def on_auto_cal(self, _=None):
+        if self.signal is None:
+            return
+        plot_rect = pygame.Rect(16, TOP_PAD, WIDTH - 280 - 32, PLOT_TOP_H)
+        self.scale = auto_calibrate(self.signal, plot_rect)
+
+    # ---------- Main loop ----------
+
+    def run(self):
+        running = True
+        last_ana = 0.0
+        metrics = AnalysisMetrics(None, None, None, None, None, None, None, "auto", "Unknown (0%)")
+        cached_fft = (np.array([]), np.array([]))
+
+        while running:
+            self.clock.tick(FPS)
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    for b in self.buttons:
+                        b.handle(event)
+
+            # Stream snapshot if live
+            if self.live_on:
+                sig = self.audio.snapshot(0.2)
+                if sig is not None:
+                    # Normalize time for the rolling window
+                    sig.time = np.arange(len(sig.amplitude)) / sig.sampling_rate
+                    self.signal = sig
+
+            # Analysis cadence
+            now = time.time()
+            if self.signal and (now - last_ana) > 0.1:
+                metrics = self.analyze(self.signal)
+                cached_fft = compute_fft(self.signal)
+                self.detected_label = metrics.detected_label
+                last_ana = now
+
+            # Draw
+            self.screen.fill(BG)
+            header = f"Current file: {self.current_file if self.current_file else '—'}    Live Status: {'On' if self.live_on else 'Off'}"
+            self.screen.blit(self.font.render(header, True, TEXT), (16, 56))
+
+            left_w = WIDTH - 280 - 32
+            plot_time = pygame.Rect(16, TOP_PAD, left_w, PLOT_TOP_H)
+            plot_fft = pygame.Rect(16, BOTTOM_PAD + PLOT_TOP_H + MID_GAP, left_w, PLOT_TOP_H)
+
+            if self.signal:
+                draw_waveform(self.screen, plot_time, self.signal, self.scale, self.font_small)
+                freqs, mag = cached_fft
+                draw_spectrum(self.screen, plot_fft, freqs, mag, metrics.f0_hz, self.font_small)
+            else:
+                draw_grid(self.screen, plot_time)
+                draw_grid(self.screen, plot_fft)
+
+            # Stats panel
+            panel = pygame.Rect(WIDTH - 280, TOP_PAD, 264, HEIGHT - TOP_PAD - 16)
+            pygame.draw.rect(self.screen, (22, 25, 35), panel, border_radius=10)
+            pygame.draw.rect(self.screen, (70, 75, 90), panel, width=2, border_radius=10)
+            sx, sy = p
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
