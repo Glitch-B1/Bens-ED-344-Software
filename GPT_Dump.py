@@ -741,3 +741,263 @@ if __name__ == "__main__":
         print("Fatal error:", e)
         pygame.quit()
         sys.exit(1)
+
+
+
+
+
+#------
+
+
+
+
+
+# ---- Robust scope CSV ingestion (drop-in) -------------------------------
+# Handles: headers, different delimiters (; , \t), decimal commas, unit scaling,
+# time+amp columns OR amplitude-only with sample interval/rate in header.
+
+import re
+from typing import Optional, Tuple, List
+
+DECIMAL_SEP_RE = re.compile(r"[-+]?\d{1,3}(?:[\.,]\d+)?(?:[eE][-+]?\d+)?")
+
+_UNIT_SCALE = {
+    "s": 1.0, "sec": 1.0, "secs": 1.0,
+    "ms": 1e-3, "us": 1e-6, "µs": 1e-6, "ns": 1e-9,
+    "v": 1.0, "mv": 1e-3, "uv": 1e-6, "µv": 1e-6,
+}
+
+def _read_text_head(path: str, max_lines: int = 400) -> List[str]:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        lines = []
+        for i, line in enumerate(f):
+            lines.append(line.rstrip("\n\r"))
+            if i >= max_lines:
+                break
+    return lines
+
+def _sniff_delimiter_and_decimal(lines: List[str]) -> Tuple[str, str]:
+    """
+    Returns (delimiter, decimal) where decimal is '.' or ','
+    """
+    candidate_delims = [",", ";", "\t"]
+    # look for a line that "looks numeric"
+    nums_line = None
+    for ln in lines:
+        if sum(ch.isdigit() for ch in ln) >= 4:
+            nums_line = ln
+            break
+    if nums_line is None:
+        return ",", "."  # default
+
+    # choose delimiter with highest split producing 2+ fields
+    best_delim = ","
+    best_count = -1
+    for d in candidate_delims:
+        c = nums_line.count(d)
+        if c > best_count:
+            best_delim, best_count = d, c
+
+    # decimal separator: if delimiter is ';' and we see commas in numbers -> decimal=','
+    dec = "."
+    if best_delim == ";":
+        if re.search(r"\d,\d", nums_line):
+            dec = ","
+    else:
+        # try to detect european style even with comma delimiter (rare)
+        # prefer '.' unless we see many patterns like 1,23 and almost no dots.
+        comma_nums = len(re.findall(r"\d,\d", nums_line))
+        dot_nums = len(re.findall(r"\d\.\d", nums_line))
+        if comma_nums > dot_nums * 3:
+            dec = ","
+    return best_delim, dec
+
+def _strip_units(token: str) -> Tuple[str, float]:
+    """
+    Extract unit in parentheses or suffix: e.g. 'Time (ms)' -> ('Time', 1e-3)
+    Returns (clean_label, scale)
+    """
+    t = token.strip().lower()
+    # parentheses
+    m = re.search(r"\(([^)]+)\)", t)
+    unit = None
+    if m:
+        unit = m.group(1).strip().lower()
+    else:
+        # suffix after space, e.g. "Voltage V" or "CH1[V]"
+        m2 = re.search(r"\[?([a-zµu]{1,2}v|[munµ]s|ms|us|ns|s)\]?$", t)
+        if m2:
+            unit = m2.group(1).strip().lower()
+    scale = _UNIT_SCALE.get(unit, 1.0) if unit else 1.0
+    # clean label (remove brackets/units)
+    label = re.sub(r"[\[\(].*?[\]\)]", "", token, flags=re.IGNORECASE).strip()
+    return label, scale
+
+def _parse_header_for_metadata(lines: List[str]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Try to find sample interval (seconds) or sample rate (Hz) in header.
+    Returns (dt, fs) where either can be None.
+    """
+    head = "\n".join(lines[:120]).lower()
+    # sample interval / delta t
+    m = re.search(r"(sample\s*interval|xinc|time\s*increment|dt|delta\s*x)\s*[,:\t ]\s*([-+.\deE]+)\s*([munµ]?s|ms|us|ns|s)?", head)
+    if m:
+        val = float(m.group(2).replace(",", "."))
+        unit = (m.group(3) or "s").lower()
+        scale = _UNIT_SCALE.get(unit, 1.0)
+        return val * scale, None
+    # sample rate
+    m = re.search(r"(sample\s*rate|sampling\s*rate|sa/s)\s*[,:\t ]\s*([-+.\deE]+)\s*(hz|khz|mhz|ghz|sa/s)?", head)
+    if m:
+        val = float(m.group(2).replace(",", "."))
+        unit = (m.group(3) or "hz").lower()
+        mult = {"hz": 1.0, "khz": 1e3, "mhz": 1e6, "ghz": 1e9, "sa/s": 1.0}.get(unit, 1.0)
+        return None, val * mult
+    return None, None
+
+def _find_data_start_and_headers(lines: List[str], delim: str) -> Tuple[int, Optional[List[str]]]:
+    """
+    Find the first data line index. If a header row with column names exists just before, return those names.
+    """
+    # Consider a line "data-like" if splitting yields 1-4 fields with mostly numeric tokens
+    def looks_data(ln: str) -> bool:
+        parts = [p.strip() for p in ln.split(delim)]
+        if len(parts) < 1:
+            return False
+        numericish = 0
+        for p in parts[:4]:
+            if DECIMAL_SEP_RE.match(p.replace(" ", "").replace("\t", "")):
+                numericish += 1
+        return numericish >= max(1, min(2, len(parts)))
+
+    header_names = None
+    for i, ln in enumerate(lines):
+        if looks_data(ln):
+            # Check if previous non-empty line looks like column headers
+            j = i - 1
+            while j >= 0 and not lines[j].strip():
+                j -= 1
+            if j >= 0:
+                prev = [p.strip() for p in lines[j].split(delim)]
+                # headers if tokens contain non-numeric labels
+                if any(re.search(r"[A-Za-z]", p) for p in prev):
+                    header_names = prev
+            return i, header_names
+    # fallback: assume first non-empty line
+    for i, ln in enumerate(lines):
+        if ln.strip():
+            return i, None
+    return 0, None
+
+def load_scope_csv_robust(path: str) -> Optional[StandardSignal]:
+    try:
+        lines = _read_text_head(path, 1000)
+        if not lines:
+            raise ValueError("Empty file")
+
+        delim, dec = _sniff_delimiter_and_decimal(lines)
+        data_start, header_names = _find_data_start_and_headers(lines, delim)
+        dt_meta, fs_meta = _parse_header_for_metadata(lines)
+
+        # Prepare the raw data text (standardize to comma delimiter & '.' decimal for parsing)
+        raw_data_lines = lines[data_start:]
+        if delim != ",":
+            raw_data_lines = [ln.replace(delim, ",") for ln in raw_data_lines]
+        if dec == ",":
+            # safe to replace decimal comma with dot (we've normalized delimiter to ',')
+            raw_data_lines = [re.sub(r"(?<=\d),(?=\d)", ".", ln) for ln in raw_data_lines]
+
+        # Try to parse into array
+        from io import StringIO
+        import numpy as _np
+
+        buf = StringIO("\n".join(raw_data_lines))
+        arr = _np.genfromtxt(buf, delimiter=",")
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        if arr.size == 0 or arr.shape[0] < 2:
+            raise ValueError("No numeric rows found")
+
+        # Determine time & amplitude columns
+        time_col_idx = None
+        amp_col_idx = None
+        time_scale = 1.0
+        amp_scale = 1.0
+
+        if header_names:
+            # try to infer from names + units
+            names = [h.strip() for h in header_names]
+            # pad/truncate names to cols
+            if len(names) < arr.shape[1]:
+                names = names + [f"col{i}" for i in range(len(names), arr.shape[1])]
+            for idx, name in enumerate(names[:arr.shape[1]]):
+                base, scale = _strip_units(name)
+                if re.search(r"\b(time|x|sec)\b", base, re.IGNORECASE):
+                    time_col_idx = idx; time_scale = scale
+                if re.search(r"\b(voltage|volt|ch\d+|y|amp|amplitude)\b", base, re.IGNORECASE):
+                    if amp_col_idx is None: amp_col_idx = idx; amp_scale = scale
+
+        # Fallback: select a monotonic column as time
+        def is_monotonic(v):
+            dv = _np.diff(v)
+            return _np.all(dv > 0) or _np.all(dv >= 0)
+
+        ncols = arr.shape[1]
+        if time_col_idx is None:
+            for i in range(ncols):
+                if is_monotonic(arr[:, i]):
+                    time_col_idx = i
+                    break
+        if amp_col_idx is None:
+            # pick the first column not chosen as time
+            for i in range(ncols):
+                if i != time_col_idx:
+                    amp_col_idx = i
+                    break
+
+        if time_col_idx is not None and amp_col_idx is not None:
+            t_raw = arr[:, time_col_idx].astype(float)
+            y_raw = arr[:, amp_col_idx].astype(float)
+            # unit scaling
+            t = t_raw * time_scale
+            y = y_raw * amp_scale
+            # fix NaNs/Infs
+            mask = _np.isfinite(t) & _np.isfinite(y)
+            t, y = t[mask], y[mask]
+            # rebase time to start at 0
+            if len(t) and t[0] != 0:
+                t = t - t[0]
+            # infer fs from time deltas
+            dt = _np.diff(t)
+            dt = dt[_np.isfinite(dt) & (dt > 0)]
+            fs = (1.0 / _np.median(dt)) if len(dt) else (fs_meta if fs_meta else 0.0)
+        else:
+            # amplitude-only CSV -> need dt or fs from header
+            if dt_meta is None and fs_meta is None:
+                raise ValueError("Amplitude-only data but missing sample interval/rate in header")
+            if dt_meta is None and fs_meta is not None:
+                dt_meta = 1.0 / fs_meta
+            y = arr[:, 0].astype(float)
+            y = y[_np.isfinite(y)]
+            t = _np.arange(len(y)) * float(dt_meta)
+            fs = 1.0 / float(dt_meta)
+
+        # Basic sorting & de-dup
+        if len(t) > 1 and not _np.all(_np.diff(t) >= 0):
+            ord_idx = _np.argsort(t)
+            t, y = t[ord_idx], y[ord_idx]
+        # Remove duplicate times
+        if len(t) > 1:
+            dt = _np.diff(t)
+            keep = _np.concatenate([[True], dt > 0])
+            t, y = t[keep], y[keep]
+
+        return StandardSignal(time=t, amplitude=y, sampling_rate=float(fs), source="csv")
+
+    except Exception as e:
+        messagebox.showerror("CSV Load Error", f"{os.path.basename(path)}\n{e}")
+        return None
+# ---- end robust scope CSV ingestion -------------------------------------
+
+
+
