@@ -106,13 +106,13 @@ _UNIT_SCALE = {
 def _read_text_head(path: str, max_lines: int = 400) -> List[str]:
     """Read up to max_lines from file; if max_lines is None or <=0, read entire file."""
     lines: List[str] = []
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:  # utf-8-sig strips BOMs
         if max_lines is None or max_lines <= 0:
             for line in f:
                 lines.append(line.rstrip("\n\r"))
             return lines
         for i, line in enumerate(f):
-            if i >= max_lines:   # stop BEFORE appending the (max_lines+1)-th line
+            if i >= max_lines:
                 break
             lines.append(line.rstrip("\n\r"))
     return lines
@@ -234,114 +234,136 @@ def _find_data_start_and_headers(lines: List[str], delim: str) -> Tuple[int, Opt
     return 0, None
 
 
+def _tok_to_float(tok: str) -> Optional[float]:
+    tok = tok.strip().strip('"').strip("'")
+    if not tok:
+        return None
+    # Decimal comma -> dot (when token looks numeric)
+    if re.search(r"\d,\d", tok):
+        tok = re.sub(r"(?<=\d),(?=\d)", ".", tok)
+    try:
+        return float(tok)
+    except Exception:
+        return None
+
+
+def _collect_numeric_rows(lines: List[str], delim: str) -> List[List[float]]:
+    """Traverse lines and collect rows with 1+ numeric tokens after splitting by delim."""
+    rows: List[List[float]] = []
+    for ln in lines:
+        if not ln or not ln.strip():
+            continue
+        parts = [p for p in ln.split(delim)]
+        nums: List[float] = []
+        for p in parts:
+            v = _tok_to_float(p)
+            if v is not None:
+                nums.append(v)
+        if len(nums) >= 1:
+            rows.append(nums)
+    return rows
+
+
+
+
+
 def load_scope_csv_robust(path: str) -> Optional[StandardSignal]:
     try:
-        lines = _read_text_head(path, max_lines=None)   # was 1000
+        # Read ENTIRE file so we don't miss late headers/data
+        lines = _read_text_head(path, max_lines=None)
         if not lines:
             raise ValueError("Empty file")
 
+        # 1) Sniff delimiter and decimal
         delim, dec = _sniff_delimiter_and_decimal(lines)
-        data_start, header_names = _find_data_start_and_headers(lines, delim)
-        dt_meta, fs_meta = _parse_header_for_metadata(lines)
 
-        # Prepare the raw data text (standardize to comma delimiter & '.' decimal for parsing)
-        raw_data_lines = lines[data_start:]
-        if delim != ",":
-            raw_data_lines = [ln.replace(delim, ",") for ln in raw_data_lines]
+        # 2) Normalize to comma delimiter for a simple split pass
+        norm_lines = [ln.replace(delim, ",") if delim != "," else ln for ln in lines]
+        # If decimal comma, normalize numeric commas to dots (keep commas as delimiters)
         if dec == ",":
-            # safe to replace decimal comma with dot (we've normalized delimiter to ',')
-            raw_data_lines = [re.sub(r"(?<=\d),(?=\d)", ".", ln) for ln in raw_data_lines]
+            norm_lines = [re.sub(r"(?<=\d),(?=\d)", ".", ln) for ln in norm_lines]
 
-        # Try to parse into array
-        from io import StringIO
-        import numpy as _np
+        # 3) Find first data-ish line and optional header names (best-effort)
+        data_start, header_names = _find_data_start_and_headers(norm_lines, ",")
+        raw_data_lines = norm_lines[data_start:]
+        if not raw_data_lines or all(not ln.strip() for ln in raw_data_lines):
+            raise ValueError("No data rows detected after header.")
 
-        buf = StringIO("\n".join(raw_data_lines))
-        arr = _np.genfromtxt(buf, delimiter=",")
-        if arr.ndim == 1:
-            arr = arr.reshape(-1, 1)
-        if arr.size == 0 or arr.shape[0] < 2:
-            raise ValueError("No numeric rows found")
+        # 4) Manually collect numeric rows (robust to junk text)
+        rows = _collect_numeric_rows(raw_data_lines, ",")
+        if not rows:
+            raise ValueError("Found header text but no numeric rows to parse.")
 
-        # Determine time & amplitude columns
-        time_col_idx = None
-        amp_col_idx = None
-        time_scale = 1.0
-        amp_scale = 1.0
+        # 5) Decide column layout
+        ncols = max(len(r) for r in rows)
+        # Build arrays with 1 or 2 columns (truncate extras, skip short rows)
+        if ncols >= 2:
+            # Use the first two numeric columns per row
+            t_vals, y_vals = [], []
+            for r in rows:
+                if len(r) >= 2:
+                    t_vals.append(r[0]); y_vals.append(r[1])
+            if len(t_vals) < 2:
+                raise ValueError("Insufficient two-column numeric data.")
+            t = np.asarray(t_vals, dtype=float)
+            y = np.asarray(y_vals, dtype=float)
 
-        if header_names:
-            # try to infer from names + units
-            names = [h.strip() for h in header_names]
-            # pad/truncate names to cols
-            if len(names) < arr.shape[1]:
-                names = names + [f"col{i}" for i in range(len(names), arr.shape[1])]
-            for idx, name in enumerate(names[:arr.shape[1]]):
-                base, scale = _strip_units(name)
-                if re.search(r"\b(time|x|sec)\b", base, re.IGNORECASE):
-                    time_col_idx = idx; time_scale = scale
-                if re.search(r"\b(voltage|volt|ch\d+|y|amp|amplitude)\b", base, re.IGNORECASE):
-                    if amp_col_idx is None: amp_col_idx = idx; amp_scale = scale
+            # Unit scaling if header suggests units
+            time_scale = 1.0; amp_scale = 1.0
+            if header_names:
+                names = [h.strip() for h in header_names]
+                if len(names) >= 1:
+                    _, time_scale = _strip_units(names[0])
+                if len(names) >= 2:
+                    _, amp_scale = _strip_units(names[1])
+            t = t * time_scale
+            y = y * amp_scale
 
-        # Fallback: select a monotonic column as time
-        def is_monotonic(v):
-            dv = _np.diff(v)
-            return _np.all(dv > 0) or _np.all(dv >= 0)
-
-        ncols = arr.shape[1]
-        if time_col_idx is None:
-            for i in range(ncols):
-                if is_monotonic(arr[:, i]):
-                    time_col_idx = i
-                    break
-        if amp_col_idx is None:
-            # pick the first column not chosen as time
-            for i in range(ncols):
-                if i != time_col_idx:
-                    amp_col_idx = i
-                    break
-
-        if time_col_idx is not None and amp_col_idx is not None:
-            t_raw = arr[:, time_col_idx].astype(float)
-            y_raw = arr[:, amp_col_idx].astype(float)
-            # unit scaling
-            t = t_raw * time_scale
-            y = y_raw * amp_scale
-            # fix NaNs/Infs
-            mask = _np.isfinite(t) & _np.isfinite(y)
+            # Clean, sort, de-dup, rebase
+            mask = np.isfinite(t) & np.isfinite(y)
             t, y = t[mask], y[mask]
-            # rebase time to start at 0
+            if len(t) > 1 and not np.all(np.diff(t) >= 0):
+                ord_idx = np.argsort(t)
+                t, y = t[ord_idx], y[ord_idx]
+            if len(t) > 1:
+                dt = np.diff(t)
+                keep = np.concatenate([[True], dt > 0])
+                t, y = t[keep], y[keep]
             if len(t) and t[0] != 0:
                 t = t - t[0]
-            # infer fs from time deltas
-            dt = _np.diff(t)
-            dt = dt[_np.isfinite(dt) & (dt > 0)]
-            fs = (1.0 / _np.median(dt)) if len(dt) else (fs_meta if fs_meta else 0.0)
+
+            # Infer Fs from time; fall back to SAMPLE_RATE if degenerate
+            if len(t) > 1:
+                dt = np.diff(t)
+                dt = dt[np.isfinite(dt) & (dt > 0)]
+                fs = (1.0 / np.median(dt)) if len(dt) else float(SAMPLE_RATE)
+            else:
+                fs = float(SAMPLE_RATE)
+
+            return StandardSignal(time=t, amplitude=y, sampling_rate=fs, source="csv")
+
         else:
-            # amplitude-only CSV -> need dt or fs from header
+            # -------- amplitude-only CSV --------
+            y = np.asarray([r[0] for r in rows], dtype=float)
+            y = y[np.isfinite(y)]
+            if y.size < 2:
+                raise ValueError("Amplitude-only data has too few numeric points.")
+
+            # Try header for dt/fs; else, graceful default to SAMPLE_RATE
+            dt_meta, fs_meta = _parse_header_for_metadata(lines)
             if dt_meta is None and fs_meta is None:
-                raise ValueError("Amplitude-only data but missing sample interval/rate in header")
-            if dt_meta is None and fs_meta is not None:
-                dt_meta = 1.0 / fs_meta
-            y = arr[:, 0].astype(float)
-            y = y[_np.isfinite(y)]
-            t = _np.arange(len(y)) * float(dt_meta)
-            fs = 1.0 / float(dt_meta)
+                fs = float(SAMPLE_RATE)  # fallback
+            else:
+                fs = float(fs_meta) if fs_meta else float(1.0 / dt_meta)
 
-        # Basic sorting & de-dup
-        if len(t) > 1 and not _np.all(_np.diff(t) >= 0):
-            ord_idx = _np.argsort(t)
-            t, y = t[ord_idx], y[ord_idx]
-        # Remove duplicate times
-        if len(t) > 1:
-            dt = _np.diff(t)
-            keep = _np.concatenate([[True], dt > 0])
-            t, y = t[keep], y[keep]
-
-        return StandardSignal(time=t, amplitude=y, sampling_rate=float(fs), source="csv")
+            t = np.arange(len(y), dtype=float) / fs
+            return StandardSignal(time=t, amplitude=y, sampling_rate=fs, source="csv")
 
     except Exception as e:
+        # Surface a clear, actionable message — the UI handler will also catch/report.
         messagebox.showerror("CSV Load Error", f"{os.path.basename(path)}\n{e}")
         return None
+
 
 # --------------------------------------- Block 4 : End ------------------------------------------#
 
@@ -613,28 +635,117 @@ def classify_waveform(freqs: np.ndarray, mag: np.ndarray, y: np.ndarray) -> Tupl
 
 # --------------------------------------- Block 7 : Calibration ------------------------------------------#
 
+
+# --------------------------------------- Block 7 : Calibration ------------------------------------------#
+
 @dataclass
 class ViewScale:
     # Scales for drawing
     volts_per_div: float
     secs_per_div: float
-    v_offset: float  # vertical center offset (volts)
-    # derived at draw time: pixels per division computed from plot rect
+    v_offset: float        # vertical center offset (volts)
+    t_start: float = 0.0   # left-edge time for the visible window (seconds)
 
 
-def auto_calibrate(signal: StandardSignal, plot_rect: pygame.Rect) -> ViewScale:
-    y = signal.amplitude
-    if len(y) == 0:
-        return ViewScale(1.0, 0.001, 0.0)
-    vpp = np.nanmax(y) - np.nanmin(y)
-    vpp = vpp if vpp > 1e-9 else 1.0
-    # Fit ~ 6 vertical divisions
-    volts_per_div = (vpp / 0.9) / 6.0
-    secs_visible = max(signal.time[-1] - signal.time[0], len(y) / signal.sampling_rate)
-    # Fit ~ 10 horizontal divisions
-    secs_per_div = (secs_visible / 0.9) / 10.0
-    v_offset = float((np.nanmax(y) + np.nanmin(y)) * 0.5)
-    return ViewScale(volts_per_div=volts_per_div, secs_per_div=secs_per_div, v_offset=v_offset)
+def auto_calibrate(
+    signal: StandardSignal,
+    plot_rect: pygame.Rect,
+    cycles_target: int = 4,
+    fit_margin: float = 0.90
+) -> ViewScale:
+    """
+    Choose scales so ~cycles_target cycles are visible horizontally and the vertical
+    range fills ~fit_margin of the plot height. Ensures at least a minimum number
+    of samples are visible and clamps to the available time span. Sets t_start to
+    show the last portion of the signal.
+    """
+    y = np.asarray(signal.amplitude, dtype=float)
+    t = np.asarray(signal.time, dtype=float)
+    if y.size < 2 or t.size < 2:
+        return ViewScale(1.0, 0.01, 0.0, 0.0)
+
+    # --- Vertical fit ---
+    y_max = np.nanmax(y); y_min = np.nanmin(y)
+    vpp = float(y_max - y_min) if np.isfinite(y_max - y_min) else 1.0
+    if vpp <= 1e-12:
+        vpp = 1.0
+    volts_per_div = (vpp / fit_margin) / 6.0
+    v_offset = float((y_max + y_min) * 0.5)
+
+    # --- Horizontal fit ---
+    total_span = float(t[-1] - t[0])
+    dt_med = float(np.median(np.diff(t))) if t.size > 1 else (1.0 / max(signal.sampling_rate, 1.0))
+
+    # Try to set span from f0; make sure we still see enough samples
+    freqs, mag = compute_fft(signal)
+    f0 = estimate_fundamental(freqs, mag)
+    span_from_cycles = (cycles_target / f0) if (f0 and f0 > 0) else min(total_span, 0.5)
+
+    # Require at least ~200 samples (or fewer if the array is small)
+    min_vis_samples = min(max(200, int(0.02 / max(dt_med, 1e-9))), y.size)  # ≥200 or ~20ms worth
+    span_from_samples = max(min_vis_samples * dt_med, 5 * dt_med)
+
+    visible_span = max(span_from_cycles, span_from_samples)
+    visible_span = min(visible_span, max(total_span, dt_med))
+
+    # Convert span -> secs/div (10 divs across, with margin)
+    secs_per_div = max(visible_span / (10.0 * fit_margin), 1e-9)
+
+    # Show the *last* chunk of the trace
+    t_start = max(t[0], t[-1] - visible_span)
+
+    return ViewScale(volts_per_div=volts_per_div, secs_per_div=secs_per_div, v_offset=v_offset, t_start=t_start)
+
+
+def ensure_visible_window(signal: StandardSignal, scale: ViewScale) -> None:
+    """
+    Make sure (t_start, secs_per_div) yields >= 2 samples. If not, slide the window
+    to the tail of the trace and/or widen slightly so we always have data to draw.
+    """
+    t = signal.time
+    if t.size < 2:
+        return
+
+    # Current window
+    span = 10.0 * max(scale.secs_per_div, 1e-12)
+    t0 = float(scale.t_start)
+    t1 = t0 + span
+
+    # Clamp t0 within data bounds
+    t0 = max(float(t[0]), min(t0, float(t[-1]) - 1e-12))
+    t1 = t0 + span
+
+    # Count samples in window
+    i0 = int(np.searchsorted(t, t0, side="left"))
+    i1 = int(np.searchsorted(t, t1, side="right"))
+    if (i1 - i0) >= 2:
+        scale.t_start = t0
+        return
+
+    # If empty/thin: snap to the end and slightly widen if needed
+    dt_med = float(np.median(np.diff(t))) if t.size > 1 else 0.0
+    if dt_med <= 0:
+        dt_med = (1.0 / max(signal.sampling_rate, 1.0))
+
+    # Ensure the span covers at least ~200 samples (or available)
+    min_samples = min(max(200, int(0.02 / max(dt_med, 1e-9))), t.size)
+    min_span = max(min_samples * dt_med, 5 * dt_med)
+
+    span = max(span, min_span)
+    scale.secs_per_div = span / 10.0
+
+    t0 = max(float(t[0]), float(t[-1]) - span)
+    scale.t_start = t0
+
+
+
+# --------------------------------------- Block 7 : End ------------------------------------------#
+
+
+
+
+
+
 # --------------------------------------- Block 7 : End ------------------------------------------#
 
 
@@ -682,69 +793,115 @@ def draw_grid(surf, rect: pygame.Rect, x_divs=10, y_divs=6):
     pygame.draw.rect(surf, AXIS, rect, width=2, border_radius=6)
 
 
+
 def draw_waveform(surf, rect: pygame.Rect, signal: Optional[StandardSignal], scale: ViewScale, font_small):
     draw_grid(surf, rect)
-    if signal is None or len(signal.time) == 0:
+    if signal is None or signal.time.size < 2:
         return
-    t = signal.time
-    y = signal.amplitude - scale.v_offset
 
-    # Mapping to pixels
-    # Vertical: volts -> pixels
+    t = signal.time
+    y = signal.amplitude
+
+    # Window from auto_calibrate: left edge and total span = 10 divs
+    t0 = float(scale.t_start)
+    span = 10.0 * max(scale.secs_per_div, 1e-12)
+    t1 = t0 + span
+
+    # Clamp to available range (belt & suspenders)
+    t_first, t_last = float(t[0]), float(t[-1])
+    if t1 <= t_first or t0 >= t_last:
+        t0 = max(t_first, t_last - span)
+        t1 = t0 + span
+
+    # --- Select only samples in the visible time window ---
+    i0 = int(np.searchsorted(t, t0, side="left"))
+    i1 = int(np.searchsorted(t, t1, side="right"))
+    if i1 - i0 < 2:
+        # Fallback: use last chunk so we always draw something
+        i1 = len(t)
+        i0 = max(0, i1 - rect.w * 4)  # a few points per pixel
+        t0 = float(t[i0])
+
+    tt = t[i0:i1]
+    yy = (y[i0:i1] - scale.v_offset)
+
+    # Map to pixels
     vpix_per_div = rect.h / 6.0
     px_per_v = vpix_per_div / max(scale.volts_per_div, 1e-12)
-    # Horizontal: seconds -> pixels
     hpix_per_div = rect.w / 10.0
     px_per_s = hpix_per_div / max(scale.secs_per_div, 1e-12)
 
-    # Use visible range based on last window for audio; for CSV just draw all
-    t0, t1 = t[0], t[-1]
-    xs = rect.x + (t - t0) * px_per_s
-    ys = rect.centery - (y * px_per_v)
+    xs_f = rect.x + (tt - t0) * px_per_s
+    ys_f = rect.centery - (yy * px_per_v)
 
-    # Clip to rect and draw polyline in chunks for perf
-    pts = np.stack([xs, ys], axis=1)
-    # Keep only points within slightly expanded rect
-    mask = (pts[:, 0] >= rect.x - 2) & (pts[:, 0] <= rect.right + 2)
-    pts = pts[mask]
-    if len(pts) >= 2:
-        pygame.draw.lines(surf, WAVE, False, pts.astype(int), 2)
+    # Keep only x within the rect; clamp y
+    x_int = np.floor(xs_f).astype(int)
+    inside = (x_int >= rect.x) & (x_int < rect.right)
+    if not np.any(inside):
+        return
+    x_int = x_int[inside]
+    y_clamped = np.clip(ys_f[inside], rect.y, rect.bottom - 1).astype(int)
+
+    # --- Rasterize by x column: draw min..max vertical segments ---
+    order = np.argsort(x_int)
+    x_sorted = x_int[order]
+    y_sorted = y_clamped[order]
+
+    uniq_x, start_idx = np.unique(x_sorted, return_index=True)
+    # Append sentinel to compute group ends
+    start_idx = np.append(start_idx, len(x_sorted))
+
+    for k in range(len(uniq_x)):
+        s = start_idx[k]
+        e = start_idx[k + 1]
+        y0 = int(np.min(y_sorted[s:e]))
+        y1 = int(np.max(y_sorted[s:e]))
+        pygame.draw.line(surf, WAVE, (int(uniq_x[k]), y0), (int(uniq_x[k]), y1), 1)
 
     # Axes annotations
     info = f"{scale.volts_per_div:.3g} V/div   {scale.secs_per_div:.3g} s/div"
     surf.blit(font_small.render(info, True, MUTED), (rect.x + 8, rect.y + 6))
 
 
+
 def draw_spectrum(surf, rect: pygame.Rect, freqs: np.ndarray, mag: np.ndarray, f0: Optional[float], font_small):
     draw_grid(surf, rect)
-    if len(freqs) == 0 or len(mag) == 0:
+    if freqs.size == 0 or mag.size == 0:
         return
 
-    # Limit to reasonable upper bound (e.g., 8 kHz for display clarity)
-    max_f = freqs[-1]
-    f_limit = min(8000.0, max_f)
-    idx = np.searchsorted(freqs, f_limit)
-    f = freqs[:idx]
-    m = mag[:idx]
+    # Limit to a reasonable upper bound for display clarity
+    max_f = float(freqs[-1])
+    f_limit = min(8000.0, max_f) if max_f > 0 else 8000.0
+    # Slice once, then map
+    i1 = int(np.searchsorted(freqs, f_limit, side="right"))
+    f = freqs[:i1]
+    m = mag[:i1]
+    if f.size < 2:
+        return
 
-    # Normalize vertical to max magnitude for drawing
-    m_db = 20 * np.log10(np.maximum(m, 1e-12))
-    m_db = m_db - np.max(m_db)  # top at 0 dB
-    # map to pixels
+    # Normalize vertical to dB, clamp to [-80, 0] dB
+    m_db = 20.0 * np.log10(np.maximum(m, 1e-12))
+    m_db -= np.max(m_db)
+    m_db = np.clip(m_db, -78.0, 0.0)
+
+    # Map to pixels
     xs = rect.x + (f / f_limit) * rect.w
-    ys = rect.bottom - (np.clip((m_db + 80), -80, 80) / 80.0) * rect.h  # show -80..0 dB
+    ys = rect.bottom - ((m_db + 80.0) / 80.0) * rect.h
 
     pts = np.stack([xs, ys], axis=1)
-    if len(pts) >= 2:
-        pygame.draw.lines(surf, SPEC, False, pts.astype(int), 2)
-#TODO (if f0 and 0 < f0 <= f_limit:) was changes from original
-    # annotate f0
-    if f0 and 0 < f0 <= f_limit:
-        x0 = rect.x + (f0 / f_limit) * rect.w
-        pygame.draw.line(surf, YELLOW, (x0, rect.y), (x0, rect.bottom), 1)
-        surf.blit(font_small.render(f"f0≈{f0:.1f} Hz", True, YELLOW), (x0 + 6, rect.y + 6))
 
+    # Keep points within the rect horizontally; clamp Y
+    mask = (pts[:, 0] >= rect.x) & (pts[:, 0] <= rect.right)
+    pts = pts[mask]
+    if len(pts) < 2:
+        return
+    pts[:, 1] = np.clip(pts[:, 1], rect.y, rect.bottom)
+
+    pygame.draw.lines(surf, SPEC, False, pts.astype(int), 2)
+
+    # Title only (we removed the f0 marker per your request)
     surf.blit(font_small.render("FFT (0 dB top, ~80 dB span)", True, MUTED), (rect.x + 8, rect.y + 6))
+
 
 
 def draw_stats(surf, x, y, metrics: AnalysisMetrics, font, font_small):
@@ -759,20 +916,20 @@ def draw_stats(surf, x, y, metrics: AnalysisMetrics, font, font_small):
     line(f"f0: {metrics.f0_hz:.2f} Hz" if metrics.f0_hz else "f0: N/A", col)
     line(f"THD: {metrics.thd_percent:.2f} %" if (metrics.thd_percent is not None) else "THD: N/A", col)
     line(f"Vpp: {metrics.vpp:.3g} V" if metrics.vpp is not None else "Vpp: N/A", col)
-    line(f"Vrms: {metrics.vrms:.3g} V" if metrics.vrms is not None else "Vrms: N/A", col)
+    # line(f"Vrms: {metrics.vrms:.3g} V" if metrics.vrms is not None else "Vrms: N/A", col)
     line(f"DC: {metrics.dc:.3g} V" if metrics.dc is not None else "DC: N/A", col)
 
     # Conditional metrics with N/A friendly display
     duty_txt = "Duty cycle: "
     if metrics.duty_percent is None:
-        duty_txt += "N/A (needs square-like)"
+        duty_txt += "N/A"
         line(duty_txt, MUTED)
     else:
         line(duty_txt + f"{metrics.duty_percent:.1f} %", col)
 
     skew_txt = "Skew: "
     if metrics.triangle_skew_percent is None:
-        skew_txt += "N/A (needs triangle-like)"
+        skew_txt += "N/A"
         line(skew_txt, MUTED)
     else:
         line(skew_txt + f"{metrics.triangle_skew_percent:.1f} %", col)
@@ -806,6 +963,7 @@ class App:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("consolas", 20)
         self.font_small = pygame.font.SysFont("consolas", 16)
+        self.pending_autocal = False  # one-shot autoscale when source changes
 
         # State
         self.signal: Optional[StandardSignal] = None
@@ -905,41 +1063,48 @@ class App:
     # ---------- Actions ----------
 
     def on_load_csv(self, _=None):
-        """Open a file dialog, load a scope CSV using the robust loader, calibrate the view."""
+        """Open a file dialog, load a scope CSV using the robust loader, calibrate the view, report status."""
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
+
+        # Important: pass 'parent=root' so dialogs stay tied to this window
         path = filedialog.askopenfilename(
             title="Choose CSV",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+            filetypes=[("CSV files", "*.csv;*.CSV"), ("All files", "*.*")],
+            parent=root
         )
         root.update()
         root.destroy()
         if not path:
             return
 
-        # Use the robust, cleaning loader
         try:
+            print(f"[CSV] Loading: {path}")  # console breadcrumb
             sig = load_scope_csv_robust(path)
-        except NameError:
-            # If the function is in the same file (not imported)
-            sig = globals()["load_scope_csv_robust"](path)
-
-        if sig is None or len(sig.time) == 0:
+            if sig is None or len(sig.time) == 0:
+                messagebox.showerror("CSV Load Error", "The file was selected but no usable data was parsed.")
+                return
+        except Exception as e:
+            # load_scope_csv_robust already shows a messagebox; this is a final safety net
+            messagebox.showerror("CSV Load Error (handler)", str(e))
             return
 
+        # Success → update state/UI
         self.signal = sig
         self.current_file = os.path.basename(path)
-        # Fit view to the loaded data
-        plot_rect = pygame.Rect(16, TOP_PAD, WIDTH - 280 - 32, PLOT_TOP_H)
-        # self.scale = auto_calibrate(self.signal, plot_rect)
         self.scale = auto_calibrate(self.signal, self.plot_time)
-        # Ensure live is off when a file is loaded
-        if self.live_on:
-            self.audio.stop()
-            self.live_on = False
-            if hasattr(self, "btn_live"):
-                self.btn_live.active = False
+
+        # Align the window and guarantee it contains samples
+        ensure_visible_window(self.signal, self.scale)
+        self.pending_autocal = False
+        self.live_on = False
+        if hasattr(self, "btn_live"):
+            self.btn_live.active = False
+
+        # Prime metrics immediately so the user sees an instant update
+        _ = self.analyze(self.signal)
+        print(f"[CSV] Loaded {self.current_file}: {len(sig.amplitude)} samples @ {sig.sampling_rate:.3g} Hz")
 
     def on_toggle_live(self, btn: Button):
         if not HAVE_SD:
@@ -952,6 +1117,7 @@ class App:
                 self.audio.start()
                 self.live_on = True
                 self.current_file = None
+                self.pending_autocal = True  # autoscale on first audio frame
             except Exception as e:
                 messagebox.showerror("Audio Error", str(e))
                 btn.active = False
@@ -1023,6 +1189,10 @@ class App:
                     sig.time = np.arange(len(sig.amplitude)) / sig.sampling_rate
                     self.signal = sig
 
+            if self.pending_autocal and self.signal is not None:
+                self.scale = auto_calibrate(self.signal, self.plot_time)
+                self.pending_autocal = False
+
             # Analysis cadence
             now = time.time()
             if self.signal and (now - last_ana) > 0.1:
@@ -1030,6 +1200,10 @@ class App:
                 cached_fft = compute_fft(self.signal)
                 self.detected_label = metrics.detected_label
                 last_ana = now
+
+            # For CSV sources, make sure the current window is still valid
+            if self.signal and self.signal.source == "csv":
+                ensure_visible_window(self.signal, self.scale)
 
             # --- Clear ---
             self.screen.fill(BG)
