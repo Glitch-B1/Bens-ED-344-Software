@@ -635,9 +635,6 @@ def classify_waveform(freqs: np.ndarray, mag: np.ndarray, y: np.ndarray) -> Tupl
 
 # --------------------------------------- Block 7 : Calibration ------------------------------------------#
 
-
-# --------------------------------------- Block 7 : Calibration ------------------------------------------#
-
 @dataclass
 class ViewScale:
     # Scales for drawing
@@ -645,6 +642,12 @@ class ViewScale:
     secs_per_div: float
     v_offset: float        # vertical center offset (volts)
     t_start: float = 0.0   # left-edge time for the visible window (seconds)
+
+
+@dataclass
+class SpectrumScale:
+    hz_per_div: float     # horizontal frequency scale
+    f_start: float        # left-edge frequency (Hz)
 
 
 def auto_calibrate(
@@ -699,54 +702,79 @@ def auto_calibrate(
 
 def ensure_visible_window(signal: StandardSignal, scale: ViewScale) -> None:
     """
-    Make sure (t_start, secs_per_div) yields >= 2 samples. If not, slide the window
-    to the tail of the trace and/or widen slightly so we always have data to draw.
+    Keep the 10-division window inside the data. Do NOT touch secs_per_div unless
+    the window is empty (<2 samples). This preserves user zoom/pan.
     """
-    t = signal.time
+    t = np.asarray(signal.time, dtype=np.float64)
     if t.size < 2:
         return
 
+    t_data0, t_data1 = float(t[0]), float(t[-1])
     # Current window
     span = 10.0 * max(scale.secs_per_div, 1e-12)
+    # Clamp t_start so the window lies within the data span
     t0 = float(scale.t_start)
+    t0 = max(t_data0, min(t0, t_data1 - span))
     t1 = t0 + span
 
-    # Clamp t0 within data bounds
-    t0 = max(float(t[0]), min(t0, float(t[-1]) - 1e-12))
-    t1 = t0 + span
-
-    # Count samples in window
+    # Check how many samples are visible
     i0 = int(np.searchsorted(t, t0, side="left"))
     i1 = int(np.searchsorted(t, t1, side="right"))
     if (i1 - i0) >= 2:
+        # Enough samples → keep user's zoom; just write back the clamped start.
         scale.t_start = t0
         return
 
-    # If empty/thin: snap to the end and slightly widen if needed
-    dt_med = float(np.median(np.diff(t))) if t.size > 1 else 0.0
-    if dt_med <= 0:
+    # ---- Minimal recovery when the window is empty/thin ----
+    # 1) Slide to the tail with the SAME span and try again.
+    t0_tail = max(t_data0, t_data1 - span)
+    i0 = int(np.searchsorted(t, t0_tail, side="left"))
+    i1 = int(np.searchsorted(t, t0_tail + span, side="right"))
+    if (i1 - i0) >= 2:
+        scale.t_start = t0_tail
+        return
+
+    # 2) Still too few → widen just enough to include at least a couple of samples,
+    #    but never exceed the full data span. Now it's OK to adjust secs_per_div.
+    dt_med = float(np.median(np.diff(t))) if t.size > 1 else (1.0 / max(signal.sampling_rate, 1.0))
+    if not (dt_med > 0):
         dt_med = (1.0 / max(signal.sampling_rate, 1.0))
 
-    # Ensure the span covers at least ~200 samples (or available)
-    min_samples = min(max(200, int(0.02 / max(dt_med, 1e-9))), t.size)
-    min_span = max(min_samples * dt_med, 5 * dt_med)
+    total_span = max(t_data1 - t_data0, dt_med)
+    needed_span = max(5 * dt_med, 2 * dt_med)  # ~a handful of samples
+    span = min(max(span, needed_span), total_span)
 
-    span = max(span, min_span)
-    scale.secs_per_div = span / 10.0
+    scale.secs_per_div = max(span / 10.0, 1e-12)
+    scale.t_start = max(t_data0, t_data1 - span)
 
-    t0 = max(float(t[0]), float(t[-1]) - span)
-    scale.t_start = t0
 
+def auto_calibrate_spectrum(freqs: np.ndarray, fit_margin: float = 0.98) -> SpectrumScale:
+    """
+    Show the full available band (0..Nyquist) across 10 divisions.
+    """
+    if freqs.size < 2:
+        return SpectrumScale(hz_per_div=1000.0, f_start=0.0)
+    f_max = float(freqs[-1])
+    span = f_max / max(fit_margin, 1e-6)
+    hz_per_div = max(span / 10.0, 1e-3)
+    return SpectrumScale(hz_per_div=hz_per_div, f_start=0.0)
+
+
+def ensure_visible_freq_window(scale: SpectrumScale, f_max: float) -> None:
+    """
+    Clamp f_start/hz_per_div so the 10-division window is inside [0, f_max].
+    """
+    f_span = 10.0 * max(scale.hz_per_div, 1e-9)
+    if f_span <= 0:
+        f_span = 1.0
+    scale.hz_per_div = f_span / 10.0  # normalize
+    # clamp
+    max_start = max(0.0, f_max - f_span)
+    scale.f_start = min(max(0.0, scale.f_start), max_start)
 
 
 # --------------------------------------- Block 7 : End ------------------------------------------#
 
-
-
-
-
-
-# --------------------------------------- Block 7 : End ------------------------------------------#
 
 
 # -
@@ -793,114 +821,114 @@ def draw_grid(surf, rect: pygame.Rect, x_divs=10, y_divs=6):
     pygame.draw.rect(surf, AXIS, rect, width=2, border_radius=6)
 
 
-
 def draw_waveform(surf, rect: pygame.Rect, signal: Optional[StandardSignal], scale: ViewScale, font_small):
     draw_grid(surf, rect)
     if signal is None or signal.time.size < 2:
         return
 
-    t = signal.time
-    y = signal.amplitude
+    t = np.asarray(signal.time, dtype=np.float64)
+    y = np.asarray(signal.amplitude, dtype=np.float64)
 
-    # Window from auto_calibrate: left edge and total span = 10 divs
-    t0 = float(scale.t_start)
+    # ----- requested window (10 divisions) -----
     span = 10.0 * max(scale.secs_per_div, 1e-12)
-    t1 = t0 + span
+    t0_req = float(scale.t_start)
+    t1_req = t0_req + span
 
-    # Clamp to available range (belt & suspenders)
-    t_first, t_last = float(t[0]), float(t[-1])
-    if t1 <= t_first or t0 >= t_last:
-        t0 = max(t_first, t_last - span)
-        t1 = t0 + span
+    # ----- intersect with available data -----
+    t0 = max(float(t[0]), t0_req)
+    t1 = min(float(t[-1]), t1_req)
+    if not (t1 > t0):
+        # snap to tail with same span
+        t1 = float(t[-1])
+        t0 = max(float(t[0]), t1 - span)
+        if not (t1 > t0):
+            return  # degenerate data
 
-    # --- Select only samples in the visible time window ---
-    i0 = int(np.searchsorted(t, t0, side="left"))
-    i1 = int(np.searchsorted(t, t1, side="right"))
-    if i1 - i0 < 2:
-        # Fallback: use last chunk so we always draw something
-        i1 = len(t)
-        i0 = max(0, i1 - rect.w * 4)  # a few points per pixel
-        t0 = float(t[i0])
+    # ----- resample uniformly: one x column per pixel -----
+    cols = max(2, rect.w)
+    # +1 endpoint so we always have at least 2 points even when rect.w == 1 (paranoia)
+    t_grid = np.linspace(t0, t1, cols, endpoint=True)
+    # interpolation strictly inside [t[0], t[-1]] due to intersection above
+    y_grid = np.interp(t_grid, t, y)
 
-    tt = t[i0:i1]
-    yy = (y[i0:i1] - scale.v_offset)
-
-    # Map to pixels
+    # center & scale
+    v_off = float(scale.v_offset)
     vpix_per_div = rect.h / 6.0
     px_per_v = vpix_per_div / max(scale.volts_per_div, 1e-12)
-    hpix_per_div = rect.w / 10.0
-    px_per_s = hpix_per_div / max(scale.secs_per_div, 1e-12)
 
-    xs_f = rect.x + (tt - t0) * px_per_s
-    ys_f = rect.centery - (yy * px_per_v)
+    xs = rect.x + (t_grid - t0) * (rect.w / max(t1 - t0, 1e-12))
+    ys = rect.centery - (y_grid - v_off) * px_per_v
 
-    # Keep only x within the rect; clamp y
-    x_int = np.floor(xs_f).astype(int)
-    inside = (x_int >= rect.x) & (x_int < rect.right)
-    if not np.any(inside):
-        return
-    x_int = x_int[inside]
-    y_clamped = np.clip(ys_f[inside], rect.y, rect.bottom - 1).astype(int)
+    # clamp and draw
+    xs = np.clip(xs, rect.x, rect.right).astype(int)
+    ys = np.clip(ys, rect.y, rect.bottom - 1).astype(int)
 
-    # --- Rasterize by x column: draw min..max vertical segments ---
-    order = np.argsort(x_int)
-    x_sorted = x_int[order]
-    y_sorted = y_clamped[order]
+    if xs.size >= 2:
+        pts = np.column_stack((xs, ys))
+        pygame.draw.aalines(surf, WAVE, False, pts)
 
-    uniq_x, start_idx = np.unique(x_sorted, return_index=True)
-    # Append sentinel to compute group ends
-    start_idx = np.append(start_idx, len(x_sorted))
-
-    for k in range(len(uniq_x)):
-        s = start_idx[k]
-        e = start_idx[k + 1]
-        y0 = int(np.min(y_sorted[s:e]))
-        y1 = int(np.max(y_sorted[s:e]))
-        pygame.draw.line(surf, WAVE, (int(uniq_x[k]), y0), (int(uniq_x[k]), y1), 1)
-
-    # Axes annotations
+    # Scale annotation
     info = f"{scale.volts_per_div:.3g} V/div   {scale.secs_per_div:.3g} s/div"
     surf.blit(font_small.render(info, True, MUTED), (rect.x + 8, rect.y + 6))
 
 
 
-def draw_spectrum(surf, rect: pygame.Rect, freqs: np.ndarray, mag: np.ndarray, f0: Optional[float], font_small):
+def draw_spectrum(
+    surf, rect: pygame.Rect, freqs: np.ndarray, mag: np.ndarray,
+    f0: Optional[float], font_small, spec_scale: "SpectrumScale"
+):
     draw_grid(surf, rect)
     if freqs.size == 0 or mag.size == 0:
         return
 
-    # Limit to a reasonable upper bound for display clarity
-    max_f = float(freqs[-1])
-    f_limit = min(8000.0, max_f) if max_f > 0 else 8000.0
-    # Slice once, then map
-    i1 = int(np.searchsorted(freqs, f_limit, side="right"))
-    f = freqs[:i1]
-    m = mag[:i1]
-    if f.size < 2:
+    f_max = float(freqs[-1])
+    if f_max <= 0:
         return
 
-    # Normalize vertical to dB, clamp to [-80, 0] dB
+    # Visible band
+    f_left = float(spec_scale.f_start)
+    f_span = 10.0 * max(spec_scale.hz_per_div, 1e-9)
+    f_right = min(f_max, f_left + f_span)
+
+    # Slice bins in [f_left, f_right]
+    i0 = int(np.searchsorted(freqs, f_left, side="left"))
+    i1 = int(np.searchsorted(freqs, f_right, side="right"))
+    if i1 - i0 < 2:
+        return
+    f = freqs[i0:i1]
+    m = mag[i0:i1]
+
+    # dB normalize to 0 dB top within the visible band
     m_db = 20.0 * np.log10(np.maximum(m, 1e-12))
     m_db -= np.max(m_db)
-    m_db = np.clip(m_db, -78.0, 0.0)
+    m_db = np.clip(m_db, -100.0, 0.0)
 
-    # Map to pixels
-    xs = rect.x + (f / f_limit) * rect.w
-    ys = rect.bottom - ((m_db + 80.0) / 80.0) * rect.h
+    # Bin to columns: preserve peaks with max-in-column
+    w = rect.w
+    cols = w
+    # Map each bin to a column
+    col = ((f - f_left) / max(f_span, 1e-12) * cols).astype(int)
+    col = np.clip(col, 0, cols - 1)
 
-    pts = np.stack([xs, ys], axis=1)
+    col_max = np.full(cols, -100.0, dtype=np.float64)
+    np.maximum.at(col_max, col, m_db)
 
-    # Keep points within the rect horizontally; clamp Y
-    mask = (pts[:, 0] >= rect.x) & (pts[:, 0] <= rect.right)
-    pts = pts[mask]
-    if len(pts) < 2:
-        return
-    pts[:, 1] = np.clip(pts[:, 1], rect.y, rect.bottom)
+    xs = rect.x + (np.arange(cols) / max(cols - 1, 1)) * rect.w
+    ys = rect.bottom - ((col_max + 100.0) / 100.0) * rect.h
 
-    pygame.draw.lines(surf, SPEC, False, pts.astype(int), 2)
+    pts = np.column_stack((xs, ys)).astype(int)
+    if len(pts) >= 2:
+        pygame.draw.lines(surf, SPEC, False, pts, 2)
 
-    # Title only (we removed the f0 marker per your request)
-    surf.blit(font_small.render("FFT (0 dB top, ~80 dB span)", True, MUTED), (rect.x + 8, rect.y + 6))
+    # f0 marker if visible
+    if f0 and f_left < f0 < f_right:
+        x0 = rect.x + ((f0 - f_left) / f_span) * rect.w
+        pygame.draw.line(surf, (180, 220, 120), (x0, rect.y), (x0, rect.bottom), 1)
+
+    # Title/scale
+    label = f"FFT (0 dB top, 100 dB span)   {spec_scale.hz_per_div:.3g} Hz/div"
+    surf.blit(font_small.render(label, True, MUTED), (rect.x + 8, rect.y + 6))
+
 
 
 
@@ -985,6 +1013,11 @@ class App:
         self.buttons: List["Button"] = []
         self._build_ui()
 
+        # Zoom and scroll
+        self.spec_scale: SpectrumScale = SpectrumScale(hz_per_div=1000.0, f_start=0.0)
+        self._spec_fmax = 0.0
+        self.pending_spec_autocal = True
+
     def _layout(self):
         """Compute static rectangles for the left sidebar and right plots."""
         PAD = self.PAD
@@ -1060,8 +1093,77 @@ class App:
         {"auto": self.btn_auto, "sine": self.btn_sine,
          "square": self.btn_square, "triangle": self.btn_triangle}[self.mode].active = True
 
-    # ---------- Actions ----------
 
+
+    # ----- Zoom/Pan helpers -----
+
+    def _zoom_time(self, mouse_pos, scroll_y, shift=False):
+        if not self.signal:
+            return
+        mx, my = mouse_pos
+        r = self.plot_time
+        if not r.collidepoint(mx, my):
+            return
+
+        # current window
+        span = 10.0 * max(self.scale.secs_per_div, 1e-12)
+        # time under cursor (anchor)
+        u = (mx - r.x) / max(r.w, 1)  # 0..1
+        t_anchor = float(self.scale.t_start) + u * span
+
+        if shift:
+            # pan: move left/right by 10% span per wheel "notch"
+            delta = -scroll_y * 0.10 * span
+            self.scale.t_start += delta
+        else:
+            # zoom: 12% per notch; positive y => zoom in
+            factor = 0.88 ** scroll_y
+            new_span = span * factor
+            self.scale.secs_per_div = max(new_span / 10.0, 1e-12)
+            # keep anchor fixed
+            self.scale.t_start = t_anchor - u * new_span
+
+        # keep window valid
+        ensure_visible_window(self.signal, self.scale)
+
+    def _zoom_freq(self, mouse_pos, scroll_y, shift=False):
+        if self.spec_scale is None or self._spec_fmax <= 0:
+            return
+        mx, my = mouse_pos
+        r = self.plot_fft
+        if not r.collidepoint(mx, my):
+            return
+
+        span = 10.0 * max(self.spec_scale.hz_per_div, 1e-9)
+        u = (mx - r.x) / max(r.w, 1)  # 0..1
+        f_anchor = float(self.spec_scale.f_start) + u * span
+
+        if shift:
+            # pan frequency by 10% span per notch
+            delta = -scroll_y * 0.10 * span
+            self.spec_scale.f_start += delta
+        else:
+            # zoom frequency
+            factor = 0.88 ** scroll_y
+            new_span = span * factor
+            self.spec_scale.hz_per_div = max(new_span / 10.0, 1e-9)
+            self.spec_scale.f_start = f_anchor - u * new_span
+
+        ensure_visible_freq_window(self.spec_scale, float(self._spec_fmax))
+
+    def _handle_wheel(self, event):
+        # Pygame wheel: event.y > 0 scroll up
+        shift = bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
+        pos = pygame.mouse.get_pos()
+        # Route to the plot under the cursor
+        if self.plot_time.collidepoint(*pos):
+            self._zoom_time(pos, event.y, shift)
+        elif self.plot_fft.collidepoint(*pos):
+            self._zoom_freq(pos, event.y, shift)
+
+
+
+    # ---------- Actions ----------
     def on_load_csv(self, _=None):
         """Open a file dialog, load a scope CSV using the robust loader, calibrate the view, report status."""
         root = tk.Tk()
@@ -1092,6 +1194,7 @@ class App:
 
         # Success → update state/UI
         self.signal = sig
+        self.pending_spec_autocal = True
         self.current_file = os.path.basename(path)
         self.scale = auto_calibrate(self.signal, self.plot_time)
 
@@ -1118,6 +1221,7 @@ class App:
                 self.live_on = True
                 self.current_file = None
                 self.pending_autocal = True  # autoscale on first audio frame
+                self.pending_spec_autocal = True
             except Exception as e:
                 messagebox.showerror("Audio Error", str(e))
                 btn.active = False
@@ -1180,7 +1284,8 @@ class App:
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     for b in self.buttons:
                         b.handle(event)
-
+                elif event.type == pygame.MOUSEWHEEL:
+                    self._handle_wheel(event)
             # Stream snapshot if live
             if self.live_on:
                 sig = self.audio.snapshot(0.2)
@@ -1200,6 +1305,17 @@ class App:
                 cached_fft = compute_fft(self.signal)
                 self.detected_label = metrics.detected_label
                 last_ana = now
+
+            # Spectrum viewport maintenance
+            freqs_tmp, _ = cached_fft
+            if freqs_tmp.size:
+                self._spec_fmax = float(freqs_tmp[-1])
+                if self.pending_spec_autocal:
+                    self.spec_scale = auto_calibrate_spectrum(freqs_tmp)
+                    ensure_visible_freq_window(self.spec_scale, self._spec_fmax)
+                    self.pending_spec_autocal = False
+                else:
+                    ensure_visible_freq_window(self.spec_scale, self._spec_fmax)
 
             # For CSV sources, make sure the current window is still valid
             if self.signal and self.signal.source == "csv":
@@ -1230,8 +1346,11 @@ class App:
             # --- Right-side plots ---
             if self.signal:
                 draw_waveform(self.screen, self.plot_time, self.signal, self.scale, self.font_small)
+
                 freqs, mag = cached_fft
-                draw_spectrum(self.screen, self.plot_fft, freqs, mag, metrics.f0_hz, self.font_small)
+                draw_spectrum(self.screen, self.plot_fft, freqs, mag, metrics.f0_hz, self.font_small, self.spec_scale)
+
+
             else:
                 draw_grid(self.screen, self.plot_time)
                 draw_grid(self.screen, self.plot_fft)

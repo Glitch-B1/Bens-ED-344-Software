@@ -1195,10 +1195,193 @@ class App:
 
 
 
+# Wave form that works ish
+
+def draw_waveform(surf, rect: pygame.Rect, signal: Optional[StandardSignal], scale: ViewScale, font_small):
+    draw_grid(surf, rect)
+    if signal is None or signal.time.size < 2:
+        return
+
+    t = signal.time
+    y = signal.amplitude
+
+    # Window from auto_calibrate: left edge and total span = 10 divs
+    t0 = float(scale.t_start)
+    span = 10.0 * max(scale.secs_per_div, 1e-12)
+    t1 = t0 + span
+
+    # Clamp to available range (belt & suspenders)
+    t_first, t_last = float(t[0]), float(t[-1])
+    if t1 <= t_first or t0 >= t_last:
+        t0 = max(t_first, t_last - span)
+        t1 = t0 + span
+
+    # --- Select only samples in the visible time window ---
+    i0 = int(np.searchsorted(t, t0, side="left"))
+    i1 = int(np.searchsorted(t, t1, side="right"))
+    if i1 - i0 < 2:
+        # Fallback: use last chunk so we always draw something
+        i1 = len(t)
+        i0 = max(0, i1 - rect.w * 4)  # a few points per pixel
+        t0 = float(t[i0])
+
+    tt = t[i0:i1]
+    yy = (y[i0:i1] - scale.v_offset)
+
+    # Map to pixels
+    vpix_per_div = rect.h / 6.0
+    px_per_v = vpix_per_div / max(scale.volts_per_div, 1e-12)
+    hpix_per_div = rect.w / 10.0
+    px_per_s = hpix_per_div / max(scale.secs_per_div, 1e-12)
+
+    xs_f = rect.x + (tt - t0) * px_per_s
+    ys_f = rect.centery - (yy * px_per_v)
+
+    # Keep only x within the rect; clamp y
+    x_int = np.floor(xs_f).astype(int)
+    inside = (x_int >= rect.x) & (x_int < rect.right)
+    if not np.any(inside):
+        return
+    x_int = x_int[inside]
+    y_clamped = np.clip(ys_f[inside], rect.y, rect.bottom - 1).astype(int)
+
+    # --- Rasterize by x column: draw min..max vertical segments ---
+    order = np.argsort(x_int)
+    x_sorted = x_int[order]
+    y_sorted = y_clamped[order]
+
+    uniq_x, start_idx = np.unique(x_sorted, return_index=True)
+    # Append sentinel to compute group ends
+    start_idx = np.append(start_idx, len(x_sorted))
+
+    for k in range(len(uniq_x)):
+        s = start_idx[k]
+        e = start_idx[k + 1]
+        y0 = int(np.min(y_sorted[s:e]))
+        y1 = int(np.max(y_sorted[s:e]))
+        pygame.draw.line(surf, WAVE, (int(uniq_x[k]), y0), (int(uniq_x[k]), y1), 1)
+
+    # Axes annotations
+    info = f"{scale.volts_per_div:.3g} V/div   {scale.secs_per_div:.3g} s/div"
+    surf.blit(font_small.render(info, True, MUTED), (rect.x + 8, rect.y + 6))
 
 
 
+# Old working spectrum
 
+
+def draw_spectrum(surf, rect: pygame.Rect, freqs: np.ndarray, mag: np.ndarray, f0: Optional[float], font_small):
+    draw_grid(surf, rect)
+    if freqs.size == 0 or mag.size == 0:
+        return
+
+    # Limit to a reasonable upper bound for display clarity
+    max_f = float(freqs[-1])
+    f_limit = min(8000.0, max_f) if max_f > 0 else 8000.0
+    # Slice once, then map
+    i1 = int(np.searchsorted(freqs, f_limit, side="right"))
+    f = freqs[:i1]
+    m = mag[:i1]
+    if f.size < 2:
+        return
+
+    # Normalize vertical to dB, clamp to [-80, 0] dB
+    m_db = 20.0 * np.log10(np.maximum(m, 1e-12))
+    m_db -= np.max(m_db)
+    m_db = np.clip(m_db, -78.0, 0.0)
+
+    # Map to pixels
+    xs = rect.x + (f / f_limit) * rect.w
+    ys = rect.bottom - ((m_db + 80.0) / 80.0) * rect.h
+
+    pts = np.stack([xs, ys], axis=1)
+
+    # Keep points within the rect horizontally; clamp Y
+    mask = (pts[:, 0] >= rect.x) & (pts[:, 0] <= rect.right)
+    pts = pts[mask]
+    if len(pts) < 2:
+        return
+    pts[:, 1] = np.clip(pts[:, 1], rect.y, rect.bottom)
+
+    pygame.draw.lines(surf, SPEC, False, pts.astype(int), 2)
+
+    # Title only (we removed the f0 marker per your request)
+    surf.blit(font_small.render("FFT (0 dB top, ~80 dB span)", True, MUTED), (rect.x + 8, rect.y + 6))
+
+
+
+# Wave form that has a continuous signal
+
+def draw_waveform(surf, rect: pygame.Rect, signal: Optional[StandardSignal], scale: ViewScale, font_small):
+    draw_grid(surf, rect)
+    if signal is None or signal.time.size < 2:
+        return
+
+    # Arrays
+    t = np.asarray(signal.time, dtype=np.float64)
+    y = np.asarray(signal.amplitude, dtype=np.float64)
+
+    # ----- visible window (10 divisions) -----
+    t0_req = float(scale.t_start)
+    span = 10.0 * max(scale.secs_per_div, 1e-12)
+    t1_req = t0_req + span
+
+    # Intersect with data span; if empty, snap to last valid span in data
+    t_data0, t_data1 = float(t[0]), float(t[-1])
+    t0 = max(t_data0, t0_req)
+    t1 = min(t_data1, t1_req)
+    if not (t1 > t0):
+        t1 = t_data1
+        t0 = max(t_data0, t1 - span)
+        if not (t1 > t0):
+            return
+
+    # ----- slice -----
+    i0 = int(np.searchsorted(t, t0, side="left"))
+    i1 = int(np.searchsorted(t, t1, side="right"))
+    i0 = max(0, i0 - 1)
+    i1 = min(len(t), i1 + 1)
+    if i1 - i0 < 2:
+        return
+
+    tt = t[i0:i1]
+    yy = y[i0:i1]
+
+    # Ensure strictly increasing time (remove duplicate stamps from some CSVs)
+    tt, keep = np.unique(tt, return_index=True)
+    yy = yy[keep]
+    if tt.size < 2:
+        return
+
+    # ----- scales -----
+    vpix_per_div = rect.h / 6.0
+    px_per_v = vpix_per_div / max(scale.volts_per_div, 1e-12)
+
+    # Center around the chosen offset
+    yy = yy - float(scale.v_offset)
+
+    # Downsample for speed if extremely dense (preserve shape)
+    max_pts = 2000
+    if tt.size > max_pts:
+        idx = np.linspace(0, tt.size - 1, max_pts).astype(int)
+        tt = tt[idx]
+        yy = yy[idx]
+
+    # Map to pixels using the true intersection [t0..t1]
+    xs = rect.x + (tt - t0) * (rect.w / max(t1 - t0, 1e-12))
+    ys = rect.centery - yy * px_per_v
+
+    # Keep inside, clamp Y
+    mask = (xs >= rect.x) & (xs <= rect.right)
+    xs = np.clip(xs[mask], rect.x, rect.right).astype(int)
+    ys = np.clip(ys[mask], rect.y, rect.bottom - 1).astype(int)
+    if xs.size >= 2:
+        pts = np.column_stack((xs, ys))
+        pygame.draw.aalines(surf, WAVE, False, pts)
+
+    # Axes annotations
+    info = f"{scale.volts_per_div:.3g} V/div   {scale.secs_per_div:.3g} s/div"
+    surf.blit(font_small.render(info, True, MUTED), (rect.x + 8, rect.y + 6))
 
 
 
