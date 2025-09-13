@@ -264,6 +264,71 @@ def _collect_numeric_rows(lines: List[str], delim: str) -> List[List[float]]:
     return rows
 
 
+def _extract_longest_sane_run(t: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Keep the longest contiguous run where dt is positive and close to the median.
+    This drops footer/junk rows that sneak in with huge time jumps.
+    """
+    if t.size < 3:
+        return t, y
+
+    # Sort by time, drop exact duplicates first
+    ord_idx = np.argsort(t)
+    t = t[ord_idx]; y = y[ord_idx]
+    dt = np.diff(t)
+    finite = np.isfinite(t) & np.isfinite(y)
+    if not np.all(finite):
+        t = t[finite]; y = y[finite]
+        if t.size < 3: return t, y
+        dt = np.diff(t)
+
+    # Median (robust) step
+    dt_pos = dt[dt > 0]
+    if dt_pos.size == 0:
+        return t[:1], y[:1]
+
+    dt_med = float(np.median(dt_pos))
+    if not (dt_med > 0):
+        return t[:1], y[:1]
+
+    # A "sane" step: 0 < dt < k * dt_med (k is generous)
+    k = 20.0
+    good = (dt > 0) & (dt < k * dt_med)
+
+    # Find the longest contiguous True run in 'good'
+    best_len = 0; best_i0 = 0
+    i = 0
+    n = good.size
+    while i < n:
+        if not good[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and good[j]:
+            j += 1
+        if (j - i) > best_len:
+            best_len = (j - i)
+            best_i0 = i
+        i = j
+
+    # If nothing found, fall back to the earliest portion where dt>0
+    if best_len <= 0:
+        # keep first small block of positive steps
+        pos = np.where(dt > 0)[0]
+        if pos.size:
+            i0 = int(pos[0]); i1 = int(min(pos[0] + 256, t.size - 1))
+            return t[i0:i1+1], y[i0:i1+1]
+        return t[: min(2, t.size)], y[: min(2, y.size)]
+
+    # The run in dt indexes maps to samples [i0 : i1+1]
+    i0 = best_i0
+    i1 = best_i0 + best_len  # inclusive on the right in samples
+    t_run = t[i0:i1+1]
+    y_run = y[i0:i1+1]
+
+    # Rebase time to start at 0 for neatness
+    t_run = t_run - t_run[0]
+    return t_run, y_run
 
 
 
@@ -302,14 +367,17 @@ def load_scope_csv_robust(path: str) -> Optional[StandardSignal]:
             t_vals, y_vals = [], []
             for r in rows:
                 if len(r) >= 2:
-                    t_vals.append(r[0]); y_vals.append(r[1])
+                    t_vals.append(r[0]);
+                    y_vals.append(r[1])
             if len(t_vals) < 2:
                 raise ValueError("Insufficient two-column numeric data.")
+
             t = np.asarray(t_vals, dtype=float)
             y = np.asarray(y_vals, dtype=float)
 
             # Unit scaling if header suggests units
-            time_scale = 1.0; amp_scale = 1.0
+            time_scale = 1.0;
+            amp_scale = 1.0
             if header_names:
                 names = [h.strip() for h in header_names]
                 if len(names) >= 1:
@@ -319,28 +387,36 @@ def load_scope_csv_robust(path: str) -> Optional[StandardSignal]:
             t = t * time_scale
             y = y * amp_scale
 
-            # Clean, sort, de-dup, rebase
+            # Filter to finite values
             mask = np.isfinite(t) & np.isfinite(y)
             t, y = t[mask], y[mask]
-            if len(t) > 1 and not np.all(np.diff(t) >= 0):
-                ord_idx = np.argsort(t)
-                t, y = t[ord_idx], y[ord_idx]
-            if len(t) > 1:
-                dt = np.diff(t)
-                keep = np.concatenate([[True], dt > 0])
-                t, y = t[keep], y[keep]
-            if len(t) and t[0] != 0:
-                t = t - t[0]
+
+            # >>> Robust cleanup: keep only the longest sane run of samples <<<
+            t, y = _extract_longest_sane_run(t, y)
+
+            if t.size < 2:
+                raise ValueError("After cleaning, not enough time samples remained.")
 
             # Infer Fs from time; fall back to SAMPLE_RATE if degenerate
-            if len(t) > 1:
+            dt = np.diff(t)
+            dt = dt[np.isfinite(dt) & (dt > 0)]
+            fs = (1.0 / np.median(dt)) if dt.size else float(SAMPLE_RATE)
+
+            # TODO remove code later
+
+            # Debuging Code
+            print(f"[CSV] rows={len(rows)}  ncols={ncols}  header_names={header_names}")
+            print(f"[CSV] t[0:3]={t[:3] if 't' in locals() else '—'}  t[-3:]={t[-3:] if 't' in locals() else '—'}")
+            print(f"[CSV] y[0:3]={y[:3] if 'y' in locals() else '—'}  y[-3:]={y[-3:] if 'y' in locals() else '—'}")
+            if 't' in locals() and len(t) > 1:
                 dt = np.diff(t)
-                dt = dt[np.isfinite(dt) & (dt > 0)]
-                fs = (1.0 / np.median(dt)) if len(dt) else float(SAMPLE_RATE)
-            else:
-                fs = float(SAMPLE_RATE)
+                print(
+                    f"[CSV] dt>0 count={np.sum(dt > 0)}  dt_med={np.median(dt[dt > 0]) if np.any(dt > 0) else '—'}")
+            # End of debuging
+
 
             return StandardSignal(time=t, amplitude=y, sampling_rate=fs, source="csv")
+
 
         else:
             # -------- amplitude-only CSV --------
@@ -357,6 +433,19 @@ def load_scope_csv_robust(path: str) -> Optional[StandardSignal]:
                 fs = float(fs_meta) if fs_meta else float(1.0 / dt_meta)
 
             t = np.arange(len(y), dtype=float) / fs
+
+            # TODO remove code later
+
+            # Debuging Code
+            print(f"[CSV] rows={len(rows)}  ncols={ncols}  header_names={header_names}")
+            print(f"[CSV] t[0:3]={t[:3] if 't' in locals() else '—'}  t[-3:]={t[-3:] if 't' in locals() else '—'}")
+            print(f"[CSV] y[0:3]={y[:3] if 'y' in locals() else '—'}  y[-3:]={y[-3:] if 'y' in locals() else '—'}")
+            if 't' in locals() and len(t) > 1:
+                dt = np.diff(t)
+                print(f"[CSV] dt>0 count={np.sum(dt > 0)}  dt_med={np.median(dt[dt > 0]) if np.any(dt > 0) else '—'}")
+            # End of debuging
+
+
             return StandardSignal(time=t, amplitude=y, sampling_rate=fs, source="csv")
 
     except Exception as e:
@@ -819,6 +908,112 @@ def draw_grid(surf, rect: pygame.Rect, x_divs=10, y_divs=6):
         y = rect.y + int(rect.h * j / y_divs)
         pygame.draw.line(surf, GRID, (rect.x, y), (rect.right, y))
     pygame.draw.rect(surf, AXIS, rect, width=2, border_radius=6)
+
+
+def draw_waveform_points(
+    surf,
+    rect: pygame.Rect,
+    signal: Optional[StandardSignal],
+    scale: ViewScale,
+    font_small,
+    point_color=WAVE,
+    radius: int = 2
+):
+    """
+    Minimal plotting: render raw samples as individual points (no interpolation, no lines).
+    Uses the current ViewScale (secs/div, volts/div, v_offset, t_start)
+    and only draws samples that fall inside the visible 10-division time window.
+    """
+    draw_grid(surf, rect)
+    if signal is None or signal.time.size < 2:
+        return
+
+    # Numpy aliases
+    t = np.asarray(signal.time, dtype=np.float64)
+    y = np.asarray(signal.amplitude, dtype=np.float64)
+
+    # --- visible window in time ---
+    span = 10.0 * max(scale.secs_per_div, 1e-12)
+    t0 = float(scale.t_start)
+    t1 = t0 + span
+
+    # Intersect with available data; if empty, bail
+    t0 = max(t0, float(t[0]))
+    t1 = min(t1, float(t[-1]))
+    if not (t1 > t0):
+        return
+
+    # --- choose only samples inside [t0, t1] ---
+    i0 = int(np.searchsorted(t, t0, side="left"))
+    i1 = int(np.searchsorted(t, t1, side="right"))
+    if (i1 - i0) <= 0:
+        return
+    t_vis = t[i0:i1]
+    y_vis = y[i0:i1]
+
+    # --- map volts → pixels ---
+    v_off = float(scale.v_offset)
+    vpix_per_div = rect.h / 6.0
+    px_per_v = vpix_per_div / max(scale.volts_per_div, 1e-12)
+
+    # --- map time → pixels ---
+    # Note: use (t - t0)/span to place points left→right in the rect
+    xs = rect.x + ((t_vis - t0) / max(span, 1e-12)) * rect.w
+    ys = rect.centery - (y_vis - v_off) * px_per_v
+
+    # Clip and convert to integers once for speed
+    xs = np.clip(xs, rect.x, rect.right - 1).astype(int)
+    ys = np.clip(ys, rect.y, rect.bottom - 1).astype(int)
+
+    # To avoid overdraw with giant files, thin points if 1M+ samples
+    max_points = rect.w * 3  # ~3 points per column worst-case
+    if xs.size > max_points:
+        step = int(np.ceil(xs.size / max_points))
+        xs = xs[::step]; ys = ys[::step]
+
+    # Draw points
+    if radius <= 1:
+        # per-pixel plot
+        for x, ypix in zip(xs, ys):
+            surf.set_at((int(x), int(ypix)), point_color)
+    else:
+        # tiny filled circles (nicer)
+        for x, ypix in zip(xs, ys):
+            pygame.draw.circle(surf, point_color, (int(x), int(ypix)), radius)
+
+    # Scale annotation (unchanged)
+    info = f"{scale.volts_per_div:.3g} V/div   {scale.secs_per_div:.3g} s/div"
+    surf.blit(font_small.render(info, True, MUTED), (rect.x + 8, rect.y + 6))
+
+
+def draw_time_debug_overlay(surf, rect, signal, scale, font_small):
+    if signal is None or signal.time.size < 2:
+        return
+    t = np.asarray(signal.time, np.float64)
+    y = np.asarray(signal.amplitude, np.float64)
+
+    span = 10.0 * max(scale.secs_per_div, 1e-12)
+    t0, t1 = float(scale.t_start), float(scale.t_start) + span
+    t0 = max(t0, float(t[0])); t1 = min(t1, float(t[-1]))
+
+    i0 = int(np.searchsorted(t, t0, side="left"))
+    i1 = int(np.searchsorted(t, t1, side="right"))
+    vis_n = max(0, i1 - i0)
+
+    dt = np.diff(t)
+    dt_med = float(np.median(dt[dt > 0])) if dt.size else float("nan")
+    txt = [
+        f"N={len(t)} vis={vis_n}",
+        f"t: [{t[0]:.6g}, {t[-1]:.6g}] span={t[-1]-t[0]:.6g}",
+        f"win: [{t0:.6g}, {t1:.6g}] ({span:.6g})",
+        f"dt_med={dt_med:.6g}  Vpp={np.nanmax(y)-np.nanmin(y):.3g}"
+    ]
+    y0 = rect.y + 6
+    for line in txt:
+        surf.blit(font_small.render(line, True, MUTED), (rect.x + 8, y0))
+        y0 += 16
+
+
 
 
 def draw_waveform(surf, rect: pygame.Rect, signal: Optional[StandardSignal], scale: ViewScale, font_small):
@@ -1346,6 +1541,8 @@ class App:
             # --- Right-side plots ---
             if self.signal:
                 draw_waveform(self.screen, self.plot_time, self.signal, self.scale, self.font_small)
+                #draw_waveform_points(self.screen, self.plot_time, self.signal, self.scale, self.font_small, radius=2)
+                #draw_time_debug_overlay(self.screen, self.plot_time, self.signal, self.scale, self.font_small)
 
                 freqs, mag = cached_fft
                 draw_spectrum(self.screen, self.plot_fft, freqs, mag, metrics.f0_hz, self.font_small, self.spec_scale)
