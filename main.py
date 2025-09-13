@@ -1131,10 +1131,10 @@ def draw_stats(surf, x, y, metrics: AnalysisMetrics, font, font_small):
     def line(txt, col=TEXT):
         nonlocal y
         surf.blit(font.render(txt, True, col), (x, y))
-        y += font.get_height() + 4
+        y += font.get_height() + 2
 
     col = TEXT
-    mode_txt = f"Analysis: {metrics.detected_label} | Mode={metrics.mode.title()}"
+    mode_txt = f"Analysis: {metrics.detected_label}"
     line(mode_txt, ACCENT if metrics.mode == "auto" else YELLOW)
     line(f"f0: {metrics.f0_hz:.2f} Hz" if metrics.f0_hz else "f0: N/A", col)
     line(f"THD: {metrics.thd_percent:.2f} %" if (metrics.thd_percent is not None) else "THD: N/A", col)
@@ -1218,17 +1218,23 @@ class App:
         PAD = self.PAD
         self.sidebar = pygame.Rect(PAD, PAD, self.SIDEBAR_W, HEIGHT - 2 * PAD)
 
-        # Panel heights (tuned to your sketch)
+        # Panel heights
         load_h = 160
         select_h = 190
-        cal_h = 72
+        cal_h = 96  # ↑ taller so the button sits comfortably inside the panel
 
-        # Panels (top→bottom); leave remaining space for Statistics
+        # Use the same small gap between *all* vertical panels
+        PANEL_GAP = 10
+
+        # Panels (top→bottom)
         self.panel_load = pygame.Rect(self.sidebar.x, self.sidebar.y, self.sidebar.w, load_h)
-        self.panel_select = pygame.Rect(self.sidebar.x, self.panel_load.bottom + PAD, self.sidebar.w, select_h)
+        self.panel_select = pygame.Rect(self.sidebar.x, self.panel_load.bottom + PANEL_GAP, self.sidebar.w, select_h)
         self.panel_cal = pygame.Rect(self.sidebar.x, self.sidebar.bottom - cal_h, self.sidebar.w, cal_h)
-        self.panel_stats = pygame.Rect(self.sidebar.x, self.panel_select.bottom + PAD,
-                                       self.sidebar.w, self.panel_cal.y - (self.panel_select.bottom + PAD))
+
+        # Statistics fills between select and calibration with the SAME gap on both sides
+        stats_top = self.panel_select.bottom + PANEL_GAP
+        stats_h = (self.panel_cal.y - PANEL_GAP) - stats_top
+        self.panel_stats = pygame.Rect(self.sidebar.x, stats_top, self.sidebar.w, stats_h)
 
         # Right side plots (split view)
         right_x = self.sidebar.right + PAD
@@ -1241,42 +1247,46 @@ class App:
 
     def _build_ui(self):
         PAD = 12
-        bw, bh = self.panel_load.w - 2 * PAD, 34
+        BTN_H = 30  # unified button height (smaller)
+        BTN_SP = 6  # unified vertical spacing
 
         # --- Load signal panel ---
         x = self.panel_load.x + PAD
-        y = self.panel_load.y + 36  # leave space for the title
+        y = self.panel_load.y + 36  # title area
+        bw = self.panel_load.w - 2 * PAD
 
         def add_here(label, cb, toggle=False):
             nonlocal y
-            btn = Button((x, y, bw, bh), label, cb, toggle=toggle)
+            btn = Button((x, y, bw, BTN_H), label, cb, toggle=toggle)
             self.buttons.append(btn)
-            y += bh + 8
+            y += BTN_H + BTN_SP
             return btn
 
         add_here("Choose file", self.on_load_csv)
         self.btn_live = add_here("Live capture", self.on_toggle_live, toggle=True)
         self.btn_live.active = False
 
-        # --- Signal select panel (vertical buttons) ---
+        # --- Signal select panel (same button size) ---
         x = self.panel_select.x + PAD
         y = self.panel_select.y + 36
         bw = self.panel_select.w - 2 * PAD
-        self.btn_square = Button((x, y, bw, bh), "Square", lambda b: self.set_mode("square"), toggle=True);
-        y += bh + 8
-        self.btn_triangle = Button((x, y, bw, bh), "Triangle", lambda b: self.set_mode("triangle"), toggle=True);
-        y += bh + 8
-        self.btn_sine = Button((x, y, bw, bh), "Sine", lambda b: self.set_mode("sine"), toggle=True);
-        y += bh + 8
-        self.btn_auto = Button((x, y, bw, bh), "Auto", lambda b: self.set_mode("auto"), toggle=True)
+
+        self.btn_square = Button((x, y, bw, BTN_H), "Square", lambda b: self.set_mode("square"), toggle=True);
+        y += BTN_H + BTN_SP
+        self.btn_triangle = Button((x, y, bw, BTN_H), "Triangle", lambda b: self.set_mode("triangle"), toggle=True);
+        y += BTN_H + BTN_SP
+        self.btn_sine = Button((x, y, bw, BTN_H), "Sine", lambda b: self.set_mode("sine"), toggle=True);
+        y += BTN_H + BTN_SP
+        self.btn_auto = Button((x, y, bw, BTN_H), "Auto", lambda b: self.set_mode("auto"), toggle=True)
+
         self.buttons += [self.btn_square, self.btn_triangle, self.btn_sine, self.btn_auto]
         self._sync_mode_buttons()
 
-        # --- Calibration panel ---
+        # --- Calibration panel (same button size; comfortably inside the panel) ---
         x = self.panel_cal.x + PAD
-        y = self.panel_cal.y + 36
+        y = self.panel_cal.y + 36 + 12  # a little breathing room under the title
         bw = self.panel_cal.w - 2 * PAD
-        self.buttons.append(Button((x, y, bw, bh), "Auto calibrate", self.on_auto_cal, toggle=False))
+        self.buttons.append(Button((x, y, bw, BTN_H), "Auto calibrate", self.on_auto_cal, toggle=True))
 
     def set_mode(self, m: str):
         self.mode = m
