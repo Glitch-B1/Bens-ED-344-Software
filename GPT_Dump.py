@@ -1384,8 +1384,70 @@ def draw_waveform(surf, rect: pygame.Rect, signal: Optional[StandardSignal], sca
     surf.blit(font_small.render(info, True, MUTED), (rect.x + 8, rect.y + 6))
 
 
+def compute_triangle_skew(y: np.ndarray, smooth_win: int = 1, prominence_frac: float = 0.02) -> Optional[float]:
+    y = np.asarray(y, dtype=float)
+    n = y.size
+    if n < 8:
+        return None
 
+    # Optional tiny smoothing (length preserving)
+    if smooth_win > 1:
+        w = max(1, int(smooth_win) | 1)  # odd
+        y = np.convolve(y, np.ones(w) / w, mode='same')
 
+    # Find local peaks/valleys by 3-point comparison (compact & fast)
+    # Handle plateaus by allowing >= / <=, which still gives a single index in practice.
+    mid = y[1:-1]
+    prev_ = y[:-2]
+    next_ = y[2:]
+    peaks = np.where((mid >= prev_) & (mid > next_))[0] + 1
+    valleys = np.where((mid <= prev_) & (mid < next_))[0] + 1
+
+    if len(peaks) == 0 or len(valleys) < 2:
+        return None
+
+    # Merge and sort extrema, label type: +1 for peak, -1 for valley
+    types = np.concatenate([np.ones_like(peaks, int), -np.ones_like(valleys, int)])
+    idxs = np.concatenate([peaks, valleys])
+    order = np.argsort(idxs)
+    idxs, types = idxs[order], types[order]
+
+    # Keep only alternating extrema and drop tiny-amplitude ones (prominence filter)
+    amp = float(y.max() - y.min()) or 1.0
+    min_jump = prominence_frac * amp
+    filt_idx, filt_type = [], []
+    for i in range(len(idxs)):
+        if not filt_type:
+            filt_idx.append(int(idxs[i]));
+            filt_type.append(int(types[i]))
+        else:
+            # require alternation and sufficient amplitude change
+            if types[i] != filt_type[-1] and abs(y[idxs[i]] - y[filt_idx[-1]]) >= min_jump:
+                filt_idx.append(int(idxs[i]));
+                filt_type.append(int(types[i]))
+
+    if len(filt_idx) < 3:
+        return None
+
+    # Build valley -> peak -> valley cycles and compute rise/fall sample counts
+    filt_idx = np.asarray(filt_idx)
+    filt_type = np.asarray(filt_type)
+    skews = []
+    i = 0
+    while i + 2 < len(filt_idx):
+        if filt_type[i] == -1 and filt_type[i + 1] == +1 and filt_type[i + 2] == -1:
+            v1, p, v2 = filt_idx[i], filt_idx[i + 1], filt_idx[i + 2]
+            rise = p - v1
+            fall = v2 - p
+            if rise > 0 and fall > 0:
+                skews.append((rise - fall) / (rise + fall))
+            i += 2  # next cycle can start at this valley
+        else:
+            i += 1  # realign until we catch valley->peak->valley
+
+    if not skews:
+        return None
+    return float(100.0 * np.mean(skews))
 
 
 

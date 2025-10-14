@@ -28,7 +28,7 @@ from tkinter import filedialog, messagebox
 
 import re
 
-
+pri_once = True
 # ------------------------------------------------ Block 1 : End ------------------------------------------------#
 
 # --------------------------------------- Block 2 : Config & constants ------------------------------------------#
@@ -405,9 +405,11 @@ def load_scope_csv_robust(path: str) -> Optional[StandardSignal]:
             # TODO remove code later
 
             # Debuging Code
+            """
             print(f"[CSV] rows={len(rows)}  ncols={ncols}  header_names={header_names}")
             print(f"[CSV] t[0:3]={t[:3] if 't' in locals() else '—'}  t[-3:]={t[-3:] if 't' in locals() else '—'}")
             print(f"[CSV] y[0:3]={y[:3] if 'y' in locals() else '—'}  y[-3:]={y[-3:] if 'y' in locals() else '—'}")
+            """
             if 't' in locals() and len(t) > 1:
                 dt = np.diff(t)
                 print(
@@ -437,9 +439,11 @@ def load_scope_csv_robust(path: str) -> Optional[StandardSignal]:
             # TODO remove code later
 
             # Debuging Code
+            """
             print(f"[CSV] rows={len(rows)}  ncols={ncols}  header_names={header_names}")
             print(f"[CSV] t[0:3]={t[:3] if 't' in locals() else '—'}  t[-3:]={t[-3:] if 't' in locals() else '—'}")
             print(f"[CSV] y[0:3]={y[:3] if 'y' in locals() else '—'}  y[-3:]={y[-3:] if 'y' in locals() else '—'}")
+            """
             if 't' in locals() and len(t) > 1:
                 dt = np.diff(t)
                 print(f"[CSV] dt>0 count={np.sum(dt > 0)}  dt_med={np.median(dt[dt > 0]) if np.any(dt > 0) else '—'}")
@@ -602,10 +606,13 @@ def compute_thd(freqs: np.ndarray, mag: np.ndarray, f0: Optional[float], max_har
 
 # Calculates Duty cycle
 def compute_duty_cycle(y: np.ndarray) -> Optional[float]:
+
     if len(y) < 4:
+
         return None
     # Robust threshold using median of upper/lower halves
     median = np.median(y)
+
     hi = y[y >= median]
     lo = y[y < median]
     if len(hi) < 5 or len(lo) < 5:
@@ -635,31 +642,149 @@ def compute_duty_cycle(y: np.ndarray) -> Optional[float]:
 
 
 # Calculates Skew of triangle
-def compute_triangle_skew(y: np.ndarray) -> Optional[float]:
-    if len(y) < 8:
+def compute_triangle_skew(y: np.ndarray, smooth_win: int = 1, prominence_frac: float = 0.02) -> Optional[float]:
+    y = np.asarray(y, dtype=float)
+    y = y[:-1]
+    mean = np.mean(y)
+    print(y)
+    n = y.size
+    if n < 8:
+        print("No data")
         return None
-    # Approx: detect peaks & troughs and compare rise vs. fall durations
-    # Smooth a little
-    ys = y if len(y) < 1024 else moving_avg(y, 5)
-    # derivative sign
-    d = np.diff(ys)
-    sign = np.sign(d)
-    # zero-crossings of derivative -> peaks/troughs
-    z = np.where(np.diff(sign) != 0)[0]
-    if len(z) < 3:
+
+    top = np.max(y)
+    bottom = np.min(y)
+
+    buf = 0.4
+
+    # -3.4188 -0.7832 @ 0.05
+    # -3.7576 -0.6864
+
+
+    tip = mean + abs(mean - top)*(1-buf)
+    tail = mean - abs(mean - bottom)*(1-buf)
+
+    r_count = 0
+    f_count = 0
+
+    r_is_counting = True
+    f_is_counting = False
+    skews = []
+    num_cycles = 1
+    calc_skew = True
+    #print(y)
+    for dot in y:
+        #print("\n\n\nTop: ", top,"\nTip: ", tip, "\nBottom: ", bottom,  "\ntail: ", tail,"\nDot = ", dot)
+        if (dot < tail):
+            #print("In dot < tail")
+            r_is_counting = True
+            f_is_counting = False
+
+            if calc_skew == True:
+                try:
+                    tmp_skew = (r_count / (r_count + f_count))*100
+                except ZeroDivisionError:
+                    tmp_skew = 0
+
+                skews.append(tmp_skew)
+                #skew = (skew + tmp_skew) / num_cycles
+                print("\ntmp Skew: ", tmp_skew)
+                calc_skew = False
+                num_cycles += 1
+                r_count = 0
+                f_count = 0
+        elif  dot > tip:
+            #print("In dot > tip")
+            f_is_counting = True
+            r_is_counting = False
+            calc_skew = True
+        elif tail < dot < tip:
+            #print("Between tail and tip")
+            if r_is_counting == True:
+                r_count += 1
+
+            elif f_is_counting == True:
+                f_count += 1
+
+
+    sk = np.array(skews[1:])
+    print(sk)
+    print( sk.mean())
+    print("End \n\n\n\n\n\n\n\n\n")
+    return sk.mean()
+
+
+
+def my_compute_triangle_skew(y):
+    if y is None or len(y) < 8:
         return None
-    # pick consecutive segments
-    periods = []
-    for i in range(len(z) - 2):
-        a, b, c = z[i], z[i + 1], z[i + 2]
-        rise = b - a
-        fall = c - b
-        if rise + fall > 0:
-            skew = (rise - fall) / (rise + fall)
-            periods.append(skew)
-    if not periods:
+    y = np.asarray(y, dtype=float)
+
+    d = np.diff(y)
+    if d.size == 0 or not np.any(np.isfinite(d)):
         return None
-    return float(np.mean(periods) * 100.0)
+
+    # robust slope quantization threshold (keeps ramps, rejects noise)
+    absd = np.abs(d)
+    thr = max(np.percentile(absd[np.isfinite(absd)], 30), 1e-12)
+
+    # slope sign: +1 rising, -1 falling, 0 near-flat; then fill zeros
+    s = np.where(d >  thr,  1, np.where(d < -thr, -1, 0))
+    for i in range(1, s.size):
+        if s[i] == 0:
+            s[i] = s[i-1]
+    k = s.size - 1
+    while k >= 0 and s[k] == 0:
+        k -= 1
+    if k >= 0:
+        s[:k+1][s[:k+1] == 0] = s[k]  # back-fill leading zeros
+    if not np.any(s):
+        return None
+
+    # valley = -1→+1, peak = +1→-1 transitions (indices are in derivative space)
+    flips = np.flatnonzero(s[1:] != s[:-1]) + 1
+    if flips.size < 2:
+        return None
+    s_before = s[flips-1]
+    s_after  = s[flips]
+    valleys = flips[(s_before == -1) & (s_after == 1)]
+    peaks   = flips[(s_before ==  1) & (s_after == -1)]
+    if valleys.size < 2 or peaks.size < 1:
+        return None
+
+    # build cycles: valley -> next peak -> next valley; measure sample counts
+    syms = []
+    vi = pi = 0
+    while vi + 1 < valleys.size and pi < peaks.size:
+        v1 = valleys[vi]
+        # first peak after v1
+        while pi < peaks.size and peaks[pi] <= v1:
+            pi += 1
+        if pi >= peaks.size:
+            break
+        p = peaks[pi]
+        # first valley after that peak
+        v2i = vi + 1
+        while v2i < valleys.size and valleys[v2i] <= p:
+            v2i += 1
+        if v2i >= valleys.size:
+            break
+        v2 = valleys[v2i]
+
+        rise = p - v1
+        fall = v2 - p
+        if rise > 0 and fall > 0:
+            syms.append(100.0 * rise / (rise + fall))
+
+        vi = v2i
+        pi += 1
+
+    if not syms:
+        return None
+    return float(np.median(syms))
+
+
+
 
 
 # Calculates a moving average
@@ -737,6 +862,7 @@ class ViewScale:
 class SpectrumScale:
     hz_per_div: float     # horizontal frequency scale
     f_start: float        # left-edge frequency (Hz)
+    db_per_div: float = 10.0  # NEW: vertical dB scale (dB per division, 10 divs tall => span = 10*db_per_div)
 
 
 def auto_calibrate(
@@ -1387,7 +1513,7 @@ class App:
             return
 
         try:
-            print(f"[CSV] Loading: {path}")  # console breadcrumb
+            #print(f"[CSV] Loading: {path}")  # console breadcrumb
             sig = load_scope_csv_robust(path)
             if sig is None or len(sig.time) == 0:
                 messagebox.showerror("CSV Load Error", "The file was selected but no usable data was parsed.")
@@ -1412,7 +1538,7 @@ class App:
 
         # Prime metrics immediately so the user sees an instant update
         _ = self.analyze(self.signal)
-        print(f"[CSV] Loaded {self.current_file}: {len(sig.amplitude)} samples @ {sig.sampling_rate:.3g} Hz")
+        #print(f"[CSV] Loaded {self.current_file}: {len(sig.amplitude)} samples @ {sig.sampling_rate:.3g} Hz")
 
     def on_toggle_live(self, btn: Button):
         if not HAVE_SD:
@@ -1458,6 +1584,7 @@ class App:
             effective_mode = lbl.lower() if lbl in ("Sine", "Square", "Triangle") else "auto"
 
         # Conditional metrics
+
         duty = compute_duty_cycle(sig.amplitude) if effective_mode == "square" else None
         skew = compute_triangle_skew(sig.amplitude) if effective_mode == "triangle" else None
 
