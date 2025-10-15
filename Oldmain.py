@@ -1,7 +1,4 @@
 
-# Main.py
-
-
 # ------------------------------------------------ Block 1 : Imports ------------------------------------------------#
 import os
 import sys
@@ -14,28 +11,19 @@ from typing import Optional, Tuple, List
 
 import numpy as np
 import pygame
-import tkinter as tk
-from tkinter import filedialog, messagebox
-import re
-
 
 # Try to import sounddevice; if unavailable, the app still runs (CSV mode only)
 try:
     import sounddevice as sd
     HAVE_SD = True
-    print("Starting audio printout\n\n")
-    print(sd.get_portaudio_version())
-    print(sd.query_devices())
-    print("\n\nEnd of auido printout \n\n")
-
 except Exception:
     HAVE_SD = False
 
-
-
-
 # Tk for file dialog (hidden root window)
+import tkinter as tk
+from tkinter import filedialog, messagebox
 
+import re
 
 pri_once = True
 # ------------------------------------------------ Block 1 : End ------------------------------------------------#
@@ -89,8 +77,8 @@ class AnalysisMetrics:
     dc: Optional[float]
     duty_percent: Optional[float]           # N/A -> None
     triangle_skew_percent: Optional[float]  # N/A -> None
-    #mode: str                               # "auto","sine","square","triangle"
-    #detected_label: str                     # e.g., "Sine (82%)" or "Square (55%)"
+    mode: str                               # "auto","sine","square","triangle"
+    detected_label: str                     # e.g., "Sine (82%)" or "Square (55%)"
 
 
 # --------------------------------------- Block 3 : End ------------------------------------------#
@@ -655,7 +643,7 @@ def compute_triangle_skew(y: np.ndarray, smooth_win: int = 1, prominence_frac: f
     y = np.asarray(y, dtype=float)
     y = y[:-1]
     mean = np.mean(y)
-    #print(y)
+    print(y)
     n = y.size
     if n < 8:
         print("No data")
@@ -697,7 +685,7 @@ def compute_triangle_skew(y: np.ndarray, smooth_win: int = 1, prominence_frac: f
 
                 skews.append(tmp_skew)
                 #skew = (skew + tmp_skew) / num_cycles
-                #print("\ntmp Skew: ", tmp_skew)
+                print("\ntmp Skew: ", tmp_skew)
                 calc_skew = False
                 num_cycles += 1
                 r_count = 0
@@ -717,10 +705,80 @@ def compute_triangle_skew(y: np.ndarray, smooth_win: int = 1, prominence_frac: f
 
 
     sk = np.array(skews[1:])
-    #print(sk)
-    #print( sk.mean())
-    #print("End \n\n\n\n\n\n\n\n\n")
+    print(sk)
+    print( sk.mean())
+    print("End \n\n\n\n\n\n\n\n\n")
     return sk.mean()
+
+
+
+def my_compute_triangle_skew(y):
+    if y is None or len(y) < 8:
+        return None
+    y = np.asarray(y, dtype=float)
+
+    d = np.diff(y)
+    if d.size == 0 or not np.any(np.isfinite(d)):
+        return None
+
+    # robust slope quantization threshold (keeps ramps, rejects noise)
+    absd = np.abs(d)
+    thr = max(np.percentile(absd[np.isfinite(absd)], 30), 1e-12)
+
+    # slope sign: +1 rising, -1 falling, 0 near-flat; then fill zeros
+    s = np.where(d >  thr,  1, np.where(d < -thr, -1, 0))
+    for i in range(1, s.size):
+        if s[i] == 0:
+            s[i] = s[i-1]
+    k = s.size - 1
+    while k >= 0 and s[k] == 0:
+        k -= 1
+    if k >= 0:
+        s[:k+1][s[:k+1] == 0] = s[k]  # back-fill leading zeros
+    if not np.any(s):
+        return None
+
+    # valley = -1→+1, peak = +1→-1 transitions (indices are in derivative space)
+    flips = np.flatnonzero(s[1:] != s[:-1]) + 1
+    if flips.size < 2:
+        return None
+    s_before = s[flips-1]
+    s_after  = s[flips]
+    valleys = flips[(s_before == -1) & (s_after == 1)]
+    peaks   = flips[(s_before ==  1) & (s_after == -1)]
+    if valleys.size < 2 or peaks.size < 1:
+        return None
+
+    # build cycles: valley -> next peak -> next valley; measure sample counts
+    syms = []
+    vi = pi = 0
+    while vi + 1 < valleys.size and pi < peaks.size:
+        v1 = valleys[vi]
+        # first peak after v1
+        while pi < peaks.size and peaks[pi] <= v1:
+            pi += 1
+        if pi >= peaks.size:
+            break
+        p = peaks[pi]
+        # first valley after that peak
+        v2i = vi + 1
+        while v2i < valleys.size and valleys[v2i] <= p:
+            v2i += 1
+        if v2i >= valleys.size:
+            break
+        v2 = valleys[v2i]
+
+        rise = p - v1
+        fall = v2 - p
+        if rise > 0 and fall > 0:
+            syms.append(100.0 * rise / (rise + fall))
+
+        vi = v2i
+        pi += 1
+
+    if not syms:
+        return None
+    return float(np.median(syms))
 
 
 
@@ -801,7 +859,6 @@ class ViewScale:
 class SpectrumScale:
     hz_per_div: float     # horizontal frequency scale
     f_start: float        # left-edge frequency (Hz)
-    db_per_div: float = 10.0  # NEW: vertical dB scale (dB per division, 10 divs tall => span = 10*db_per_div)
 
 
 def auto_calibrate(
@@ -811,8 +868,10 @@ def auto_calibrate(
     fit_margin: float = 0.90
 ) -> ViewScale:
     """
-    Choose scales so ~cycles_target cycles are visible horizontally and
-    the vertical range fills ~fit_margin of the plot height.
+    Choose scales so ~cycles_target cycles are visible horizontally and the vertical
+    range fills ~fit_margin of the plot height. Ensures at least a minimum number
+    of samples are visible and clamps to the available time span. Sets t_start to
+    show the last portion of the signal.
     """
     y = np.asarray(signal.amplitude, dtype=float)
     t = np.asarray(signal.time, dtype=float)
@@ -831,37 +890,26 @@ def auto_calibrate(
     total_span = float(t[-1] - t[0])
     dt_med = float(np.median(np.diff(t))) if t.size > 1 else (1.0 / max(signal.sampling_rate, 1.0))
 
-    # Try to set span from f0
+    # Try to set span from f0; make sure we still see enough samples
     freqs, mag = compute_fft(signal)
     f0 = estimate_fundamental(freqs, mag)
     span_from_cycles = (cycles_target / f0) if (f0 and f0 > 0) else min(total_span, 0.5)
 
-    # Require minimum samples visible
-    min_vis_samples = min(max(200, int(0.02 / max(dt_med, 1e-9))), y.size)
+    # Require at least ~200 samples (or fewer if the array is small)
+    min_vis_samples = min(max(200, int(0.02 / max(dt_med, 1e-9))), y.size)  # ≥200 or ~20ms worth
     span_from_samples = max(min_vis_samples * dt_med, 5 * dt_med)
 
     visible_span = max(span_from_cycles, span_from_samples)
     visible_span = min(visible_span, max(total_span, dt_med))
 
+    # Convert span -> secs/div (10 divs across, with margin)
     secs_per_div = max(visible_span / (10.0 * fit_margin), 1e-9)
+
+    # Show the *last* chunk of the trace
     t_start = max(t[0], t[-1] - visible_span)
 
-    return ViewScale(volts_per_div=volts_per_div, secs_per_div=secs_per_div,
-                     v_offset=v_offset, t_start=t_start)
+    return ViewScale(volts_per_div=volts_per_div, secs_per_div=secs_per_div, v_offset=v_offset, t_start=t_start)
 
-
-
-def auto_calibrate_spectrum(freqs: np.ndarray, fit_margin: float = 0.98) -> SpectrumScale:
-    """
-    Show the full available band (0..Nyquist) across 10 divisions horizontally.
-    Vertical (dB) starts at 10 dB/div for a 100 dB total span (matches your current look).
-    """
-    if freqs.size < 2:
-        return SpectrumScale(hz_per_div=1000.0, f_start=0.0, db_per_div=10.0)
-    f_max = float(freqs[-1])
-    span = f_max / max(fit_margin, 1e-6)
-    hz_per_div = max(span / 10.0, 1e-3)
-    return SpectrumScale(hz_per_div=hz_per_div, f_start=0.0, db_per_div=10.0)
 
 def ensure_visible_window(signal: StandardSignal, scale: ViewScale) -> None:
     """
@@ -911,6 +959,17 @@ def ensure_visible_window(signal: StandardSignal, scale: ViewScale) -> None:
     scale.t_start = max(t_data0, t_data1 - span)
 
 
+def auto_calibrate_spectrum(freqs: np.ndarray, fit_margin: float = 0.98) -> SpectrumScale:
+    """
+    Show the full available band (0..Nyquist) across 10 divisions.
+    """
+    if freqs.size < 2:
+        return SpectrumScale(hz_per_div=1000.0, f_start=0.0)
+    f_max = float(freqs[-1])
+    span = f_max / max(fit_margin, 1e-6)
+    hz_per_div = max(span / 10.0, 1e-3)
+    return SpectrumScale(hz_per_div=hz_per_div, f_start=0.0)
+
 
 def ensure_visible_freq_window(scale: SpectrumScale, f_max: float) -> None:
     """
@@ -938,28 +997,6 @@ def ensure_visible_freq_window(scale: SpectrumScale, f_max: float) -> None:
 # --------------------------------------- Block 8 : Drawing ------------------------------------------#
 
 
-def _inner_plot_rect(rect: pygame.Rect, x_major: int, left_axis_index: int = 1, gap_px: int = 4) -> pygame.Rect:
-    """Return a rect that starts just to the right of the bold left axis."""
-    axis_x = rect.x + int(round(rect.w * left_axis_index / x_major))
-    x = min(rect.right - 1, axis_x + gap_px)
-    return pygame.Rect(x, rect.y, rect.right - x, rect.h)
-
-
-def _eng(v: float, unit: str) -> str:
-    """Tiny engineering formatter (~3 sig figs)."""
-    if v == 0 or not math.isfinite(v):
-        return f"0 {unit}"
-    ab = abs(v)
-    if ab >= 1e9:  return f"{v/1e9:.3g} G{unit}"
-    if ab >= 1e6:  return f"{v/1e6:.3g} M{unit}"
-    if ab >= 1e3:  return f"{v/1e3:.3g} k{unit}"
-    if ab >= 1:    return f"{v:.3g} {unit}"
-    if ab >= 1e-3: return f"{v*1e3:.3g} m{unit}"
-    if ab >= 1e-6: return f"{v*1e6:.3g} µ{unit}"
-    if ab >= 1e-9: return f"{v*1e9:.3g} n{unit}"
-    return f"{v:.3g} {unit}"
-
-
 class Button:
     def __init__(self, rect, label, on_click, toggle=False):
         self.rect = pygame.Rect(rect)
@@ -982,62 +1019,17 @@ class Button:
                     self.active = not self.active
                 self.on_click(self)
 
-# --- Back-compat wrapper: keep existing call sites working ---
-def draw_grid(surf, rect: pygame.Rect, x_divs=8, y_divs=6):
-     draw_scope_grid(surf, rect, x_major=x_divs, y_major=y_divs, minors=0)
 
-
-
-def draw_scope_grid(
-    surf: pygame.Surface,
-    rect: pygame.Rect,
-    x_major: int = 8,
-    y_major: int = 6,
-    minors: int = 0,
-    zero_x: Optional[int] = None,
-    zero_y: Optional[int] = None,
-    left_axis_at_first_major: bool = True,
-):
-    """
-    Clean oscilloscope grid with fewer lines and a bold left axis at the first major division.
-    """
-    # panel background & border
+def draw_grid(surf, rect: pygame.Rect, x_divs=10, y_divs=6):
     pygame.draw.rect(surf, (22, 25, 35), rect, border_radius=6)
-    pygame.draw.rect(surf, AXIS, rect, width=1, border_radius=6)
-
-    def vline(x, col, w=1): pygame.draw.line(surf, col, (x, rect.y), (x, rect.bottom), w)
-    def hline(y, col, w=1): pygame.draw.line(surf, col, (rect.x, y), (rect.right, y), w)
-
-    # optional minor grid (kept off by default)
-    if minors and minors > 1:
-        xm = x_major * minors
-        ym = y_major * minors
-        minor_col = (42, 46, 58)
-        for i in range(1, xm):
-            x = rect.x + int(round(rect.w * i / xm))
-            vline(x, minor_col, 1)
-        for j in range(1, ym):
-            y = rect.y + int(round(rect.h * j / ym))
-            hline(y, minor_col, 1)
-
-    # major grid (reduced count → clearer)
-    for i in range(1, x_major):
-        x = rect.x + int(round(rect.w * i / x_major))
-        vline(x, GRID, 2)
-    for j in range(1, y_major):
-        y = rect.y + int(round(rect.h * j / y_major))
-        hline(y, GRID, 2)
-
-    # emphasized zero axes (optional)
-    if zero_x is not None:
-        vline(int(zero_x), (110, 115, 130), 3)
-    if zero_y is not None:
-        hline(int(zero_y), (110, 115, 130), 3)
-
-    # bold left axis at first major division (like your concept)
-    if left_axis_at_first_major and x_major > 1:
-        x0 = rect.x + int(round(rect.w * 1 / x_major))   # first major line in from the left
-        vline(x0, (150, 155, 170), 4)
+    # grid lines
+    for i in range(1, x_divs):
+        x = rect.x + int(rect.w * i / x_divs)
+        pygame.draw.line(surf, GRID, (x, rect.y), (x, rect.bottom))
+    for j in range(1, y_divs):
+        y = rect.y + int(rect.h * j / y_divs)
+        pygame.draw.line(surf, GRID, (rect.x, y), (rect.right, y))
+    pygame.draw.rect(surf, AXIS, rect, width=2, border_radius=6)
 
 
 def draw_waveform_points(
@@ -1144,248 +1136,148 @@ def draw_time_debug_overlay(surf, rect, signal, scale, font_small):
         y0 += 16
 
 
-def draw_waveform(
-    surf: pygame.Surface,
-    rect: pygame.Rect,
-    signal: Optional[StandardSignal],
-    scale: ViewScale,
-    font_small: pygame.font.Font,
-):
-    X_MAJOR, Y_MAJOR = 8, 6
-    HEADER_H  = 24                          # top header band
-    X_LABEL_H = font_small.get_height() + 6 # bottom band for time labels
 
-    # --- Split areas ----------------------------------------------------------
-    header_rect = pygame.Rect(rect.x, rect.y, rect.w, min(HEADER_H, rect.h))
-    body_rect   = pygame.Rect(rect.x, rect.y + header_rect.h, rect.w, rect.h - header_rect.h)
-    # bottom label band inside body
-    xlab_h = min(X_LABEL_H, body_rect.h // 4)
-    xlab_rect = pygame.Rect(body_rect.x, body_rect.bottom - xlab_h, body_rect.w, xlab_h)
-    plot_rect = pygame.Rect(body_rect.x, body_rect.y, body_rect.w, body_rect.h - xlab_h)
 
-    # Header fill + divider
-    header_col = (30, 33, 43)
-    pygame.draw.rect(surf, header_col, header_rect, border_radius=6)
-    pygame.draw.rect(surf, (22, 25, 35), body_rect, border_radius=6)
-    pygame.draw.line(surf, AXIS, (body_rect.x, body_rect.y), (body_rect.right, body_rect.y), 1)
-
-    # --- Grid in plot area only ----------------------------------------------
-    draw_scope_grid(
-        surf, plot_rect, x_major=X_MAJOR, y_major=Y_MAJOR, minors=0,
-        zero_y=None, left_axis_at_first_major=True
-    )
-    inner = _inner_plot_rect(plot_rect, x_major=X_MAJOR, left_axis_index=1, gap_px=6)
-
-    # --- Header text ----------------------------------------------------------
-    header_txt = f"{scale.volts_per_div:.3g} V/div   {scale.secs_per_div:.3g} s/div"
-    surf.set_clip(header_rect)
-    surf.blit(font_small.render(header_txt, True, MUTED), (header_rect.x + 8, header_rect.y + 4))
-    surf.set_clip(None)
-
-    # --- Y-axis labels (inside plot_rect, left of inner) ----------------------
-    vpix_per_div = plot_rect.h / 6.0
-    px_per_v = vpix_per_div / max(scale.volts_per_div, 1e-12)
-    surf.set_clip(plot_rect)
-    for j in range(Y_MAJOR + 1):
-        y = plot_rect.y + int(round(plot_rect.h * j / Y_MAJOR))
-        v_value = scale.v_offset + (plot_rect.centery - y) / px_per_v
-        label = font_small.render(_eng(v_value, "V"), True, MUTED)
-        lx = inner.x - label.get_width() - 6
-        ly = y - label.get_height() // 2
-        if ly < plot_rect.y or ly + label.get_height() > plot_rect.bottom:
-            continue
-        surf.blit(label, (lx, ly))
-    surf.set_clip(None)
-
+def draw_waveform(surf, rect: pygame.Rect, signal: Optional[StandardSignal], scale: ViewScale, font_small):
+    draw_grid(surf, rect)
     if signal is None or signal.time.size < 2:
-        # still draw empty X labels so the layout looks complete
-        span = 10.0 * max(scale.secs_per_div, 1e-12)
-        t0 = float(scale.t_start)
-        t1 = t0 + span
-    else:
-        # ----- Visible window & resample into inner width ---------------------
-        t = np.asarray(signal.time, dtype=np.float64)
-        y = np.asarray(signal.amplitude, dtype=np.float64)
-        span = 10.0 * max(scale.secs_per_div, 1e-12)
-        t0 = float(scale.t_start); t1 = t0 + span
-        t0 = max(float(t[0]), t0); t1 = min(float(t[-1]), t1)
+        return
+
+    t = np.asarray(signal.time, dtype=np.float64)
+    y = np.asarray(signal.amplitude, dtype=np.float64)
+
+    # ----- requested window (10 divisions) -----
+    span = 10.0 * max(scale.secs_per_div, 1e-12)
+    t0_req = float(scale.t_start)
+    t1_req = t0_req + span
+
+    # ----- intersect with available data -----
+    t0 = max(float(t[0]), t0_req)
+    t1 = min(float(t[-1]), t1_req)
+    if not (t1 > t0):
+        # snap to tail with same span
+        t1 = float(t[-1])
+        t0 = max(float(t[0]), t1 - span)
         if not (t1 > t0):
-            t1 = float(t[-1]); t0 = max(float(t[0]), t1 - span)
-            if not (t1 > t0):
-                # draw labels band and return
-                pass
-        cols = max(2, inner.w)
-        t_grid = np.linspace(t0, t1, cols, endpoint=True)
-        y_grid = np.interp(t_grid, t, y)
+            return  # degenerate data
 
-        xs = inner.x + (t_grid - t0) * (inner.w / max(t1 - t0, 1e-12))
-        ys = plot_rect.centery - (y_grid - float(scale.v_offset)) * px_per_v
-        xs = np.clip(xs, inner.x, inner.right).astype(int)
-        ys = np.clip(ys, plot_rect.y, plot_rect.bottom - 1).astype(int)
+    # ----- resample uniformly: one x column per pixel -----
+    cols = max(2, rect.w)
+    # +1 endpoint so we always have at least 2 points even when rect.w == 1 (paranoia)
+    t_grid = np.linspace(t0, t1, cols, endpoint=True)
+    # interpolation strictly inside [t[0], t[-1]] due to intersection above
+    y_grid = np.interp(t_grid, t, y)
 
-        if xs.size >= 2:
-            pts = np.column_stack((xs, ys))
-            surf.set_clip(inner)
-            pygame.draw.aalines(surf, WAVE, False, pts)
-            surf.set_clip(None)
+    # center & scale
+    v_off = float(scale.v_offset)
+    vpix_per_div = rect.h / 6.0
+    px_per_v = vpix_per_div / max(scale.volts_per_div, 1e-12)
 
-    # --- Bottom X (time) labels in dedicated band ----------------------------
-    surf.set_clip(xlab_rect)
-    pygame.draw.rect(surf, (22, 25, 35), xlab_rect)  # ensure clean background
-    step_t = span / X_MAJOR
-    for i in range(1, X_MAJOR + 1):
-        t_here = t0 + i * step_t
-        if t_here > t1 + 1e-15:
-            break
-        x = inner.x + int(round((t_here - t0) / span * inner.w))
-        label = font_small.render(_eng(t_here, "s"), True, MUTED)
-        x = max(inner.x, min(inner.right - label.get_width(), x - label.get_width() // 2))
-        y = xlab_rect.bottom - label.get_height() - 2
-        surf.blit(label, (x, y))
-    surf.set_clip(None)
+    xs = rect.x + (t_grid - t0) * (rect.w / max(t1 - t0, 1e-12))
+    ys = rect.centery - (y_grid - v_off) * px_per_v
+
+    # clamp and draw
+    xs = np.clip(xs, rect.x, rect.right).astype(int)
+    ys = np.clip(ys, rect.y, rect.bottom - 1).astype(int)
+
+    if xs.size >= 2:
+        pts = np.column_stack((xs, ys))
+        pygame.draw.aalines(surf, WAVE, False, pts)
+
+    # Scale annotation
+    info = f"{scale.volts_per_div:.3g} V/div   {scale.secs_per_div:.3g} s/div"
+    surf.blit(font_small.render(info, True, MUTED), (rect.x + 8, rect.y + 6))
+
 
 
 def draw_spectrum(
-    surf: pygame.Surface,
-    rect: pygame.Rect,
-    freqs: np.ndarray,
-    mag: np.ndarray,
-    f0: Optional[float],
-    font_small: pygame.font.Font,
-    spec_scale: "SpectrumScale",
+    surf, rect: pygame.Rect, freqs: np.ndarray, mag: np.ndarray,
+    f0: Optional[float], font_small, spec_scale: "SpectrumScale"
 ):
-    X_MAJOR, Y_MAJOR = 8, 6
-    HEADER_H  = 24
-    X_LABEL_H = font_small.get_height() + 6
-
-    # --- Split areas ----------------------------------------------------------
-    header_rect = pygame.Rect(rect.x, rect.y, rect.w, min(HEADER_H, rect.h))
-    body_rect   = pygame.Rect(rect.x, rect.y + header_rect.h, rect.w, rect.h - header_rect.h)
-    xlab_h = min(X_LABEL_H, body_rect.h // 4)
-    xlab_rect = pygame.Rect(body_rect.x, body_rect.bottom - xlab_h, body_rect.w, xlab_h)
-    plot_rect = pygame.Rect(body_rect.x, body_rect.y, body_rect.w, body_rect.h - xlab_h)
-
-    header_col = (30, 33, 43)
-    pygame.draw.rect(surf, header_col, header_rect, border_radius=6)
-    pygame.draw.rect(surf, (22, 25, 35), body_rect, border_radius=6)
-    pygame.draw.line(surf, AXIS, (body_rect.x, body_rect.y), (body_rect.right, body_rect.y), 1)
-
-    # Grid only in plot area
-    draw_scope_grid(surf, plot_rect, x_major=X_MAJOR, y_major=Y_MAJOR, minors=0, left_axis_at_first_major=True)
-    inner = _inner_plot_rect(plot_rect, x_major=X_MAJOR, left_axis_index=1, gap_px=6)
-
-    # Header
-    span_db = 10.0 * max(spec_scale.db_per_div, 1e-6)
-    header = f"FFT (0 dB top, {int(span_db)} dB span)   {spec_scale.hz_per_div:.3g} Hz/div"
-    surf.set_clip(header_rect)
-    surf.blit(font_small.render(header, True, MUTED), (header_rect.x + 8, header_rect.y + 4))
-    surf.set_clip(None)
-
-    # Y labels (dB) inside plot_rect
-    surf.set_clip(plot_rect)
-    for j in range(Y_MAJOR + 1):
-        y = plot_rect.y + int(round(plot_rect.h * j / Y_MAJOR))
-        val_db = 0.0 - j * (span_db / Y_MAJOR)
-        txt = f"{val_db:.0f} dB" if abs(val_db) >= 0.5 else "0 dB"
-        srf = font_small.render(txt, True, MUTED)
-        lx = inner.x - srf.get_width() - 6
-        ly = y - srf.get_height() // 2
-        if ly < plot_rect.y or ly + srf.get_height() > plot_rect.bottom:
-            continue
-        surf.blit(srf, (lx, ly))
-    surf.set_clip(None)
-
-    # Return early if no data — still draw bottom axis band
+    draw_grid(surf, rect)
     if freqs.size == 0 or mag.size == 0:
-        f_left = float(spec_scale.f_start)
-        f_span = 10.0 * max(spec_scale.hz_per_div, 1e-9)
-        f_right = f_left + f_span
-    else:
-        f_max = float(freqs[-1])
-        if f_max <= 0:
-            return
-        f_left = float(spec_scale.f_start)
-        f_span = 10.0 * max(spec_scale.hz_per_div, 1e-9)
-        f_right = min(f_max, f_left + f_span)
+        return
 
-        i0 = int(np.searchsorted(freqs, f_left, side="left"))
-        i1 = int(np.searchsorted(freqs, f_right, side="right"))
-        if i1 - i0 >= 2:
-            f = freqs[i0:i1]
-            m = mag[i0:i1]
+    f_max = float(freqs[-1])
+    if f_max <= 0:
+        return
 
-            m_db = 20.0 * np.log10(np.maximum(m, 1e-12))
-            m_db -= np.max(m_db)
-            m_db = np.clip(m_db, -span_db, 0.0)
+    # Visible band
+    f_left = float(spec_scale.f_start)
+    f_span = 10.0 * max(spec_scale.hz_per_div, 1e-9)
+    f_right = min(f_max, f_left + f_span)
 
-            cols = max(1, inner.w)
-            col = ((f - f_left) / max(f_span, 1e-12) * cols).astype(int)
-            col = np.clip(col, 0, cols - 1)
-            col_max = np.full(cols, -span_db, dtype=np.float64)
-            np.maximum.at(col_max, col, m_db)
+    # Slice bins in [f_left, f_right]
+    i0 = int(np.searchsorted(freqs, f_left, side="left"))
+    i1 = int(np.searchsorted(freqs, f_right, side="right"))
+    if i1 - i0 < 2:
+        return
+    f = freqs[i0:i1]
+    m = mag[i0:i1]
 
-            xs = inner.x + (np.arange(cols) / max(cols - 1, 1)) * inner.w
-            ys = inner.bottom - ((col_max + span_db) / span_db) * inner.h
+    # dB normalize to 0 dB top within the visible band
+    m_db = 20.0 * np.log10(np.maximum(m, 1e-12))
+    m_db -= np.max(m_db)
+    m_db = np.clip(m_db, -100.0, 0.0)
 
-            pts = np.column_stack((xs, ys)).astype(int)
-            if len(pts) >= 2:
-                surf.set_clip(inner)
-                pygame.draw.lines(surf, SPEC, False, pts, 2)
-                surf.set_clip(None)
+    # Bin to columns: preserve peaks with max-in-column
+    w = rect.w
+    cols = w
+    # Map each bin to a column
+    col = ((f - f_left) / max(f_span, 1e-12) * cols).astype(int)
+    col = np.clip(col, 0, cols - 1)
 
-            if f0 and f_left < f0 < f_right:
-                x0 = inner.x + ((f0 - f_left) / f_span) * inner.w
-                pygame.draw.line(surf, (180, 220, 120), (x0, inner.y), (x0, inner.bottom), 1)
+    col_max = np.full(cols, -100.0, dtype=np.float64)
+    np.maximum.at(col_max, col, m_db)
 
-    # --- Bottom X (Hz) labels in dedicated band -------------------------------
-    surf.set_clip(xlab_rect)
-    pygame.draw.rect(surf, (22, 25, 35), xlab_rect)  # clean band
-    step_f = f_span / X_MAJOR
-    for i in range(1, X_MAJOR + 1):
-        f_here = f_left + i * step_f
-        if f_here > f_right + 1e-9:
-            break
-        x = inner.x + int(round((f_here - f_left) / f_span * inner.w))
-        srf = font_small.render(_eng(f_here, "Hz"), True, MUTED)
-        x = max(inner.x, min(inner.right - srf.get_width(), x - srf.get_width() // 2))
-        y = xlab_rect.bottom - srf.get_height() - 2
-        surf.blit(srf, (x, y))
-    surf.set_clip(None)
+    xs = rect.x + (np.arange(cols) / max(cols - 1, 1)) * rect.w
+    ys = rect.bottom - ((col_max + 100.0) / 100.0) * rect.h
 
+    pts = np.column_stack((xs, ys)).astype(int)
+    if len(pts) >= 2:
+        pygame.draw.lines(surf, SPEC, False, pts, 2)
+
+    # f0 marker if visible
+    if f0 and f_left < f0 < f_right:
+        x0 = rect.x + ((f0 - f_left) / f_span) * rect.w
+        pygame.draw.line(surf, (180, 220, 120), (x0, rect.y), (x0, rect.bottom), 1)
+
+    # Title/scale
+    label = f"FFT (0 dB top, 100 dB span)   {spec_scale.hz_per_div:.3g} Hz/div"
+    surf.blit(font_small.render(label, True, MUTED), (rect.x + 8, rect.y + 6))
 
 
 
 
 def draw_stats(surf, x, y, metrics: AnalysisMetrics, font, font_small):
-    """
-    Render all stats unconditionally. Unavailable values show as 'N/A' in MUTED color.
-    Uses existing palette constants: TEXT, MUTED.
-    """
     def line(txt, col=TEXT):
         nonlocal y
         surf.blit(font.render(txt, True, col), (x, y))
         y += font.get_height() + 2
 
-    def is_num(v):
-        try:
-            return v is not None and math.isfinite(float(v))
-        except Exception:
-            return False
+    col = TEXT
+    mode_txt = f"Analysis: {metrics.detected_label}"
+    line(mode_txt, ACCENT if metrics.mode == "auto" else YELLOW)
+    line(f"f0: {metrics.f0_hz:.2f} Hz" if metrics.f0_hz else "f0: N/A", col)
+    line(f"THD: {metrics.thd_percent:.2f} %" if (metrics.thd_percent is not None) else "THD: N/A", col)
+    line(f"Vpp: {metrics.vpp:.3g} V" if metrics.vpp is not None else "Vpp: N/A", col)
+    # line(f"Vrms: {metrics.vrms:.3g} V" if metrics.vrms is not None else "Vrms: N/A", col)
+    line(f"DC: {metrics.dc:.3g} V" if metrics.dc is not None else "DC: N/A", col)
 
-    def render(label, value, fmt):
-        if is_num(value):
-            line(f"{label}: {fmt(value)}", TEXT)
-        else:
-            line(f"{label}: N/A", MUTED)
+    # Conditional metrics with N/A friendly display
+    duty_txt = "Duty cycle: "
+    if metrics.duty_percent is None:
+        duty_txt += "N/A"
+        line(duty_txt, MUTED)
+    else:
+        line(duty_txt + f"{metrics.duty_percent:.1f} %", col)
 
-    # NOTE: Analysis line removed per request
-
-    render("f0",               metrics.f0_hz,               lambda v: f"{v:.2f} Hz")
-    render("THD",              metrics.thd_percent,         lambda v: f"{v:.2f} %")
-    render("Vpp",              metrics.vpp,                 lambda v: f"{v:.3g} V")
-    render("DC",               metrics.dc,                  lambda v: f"{v:.3g} V")
-    render("Duty cycle",       metrics.duty_percent,        lambda v: f"{v:.1f} %")
-    render("Skew",             metrics.triangle_skew_percent, lambda v: f"{v:.1f} %")
+    skew_txt = "Skew: "
+    if metrics.triangle_skew_percent is None:
+        skew_txt += "N/A"
+        line(skew_txt, MUTED)
+    else:
+        line(skew_txt + f"{metrics.triangle_skew_percent:.1f} %", col)
 
 
 def draw_titled_panel(surf, rect: pygame.Rect, title: str, font):
@@ -1421,8 +1313,8 @@ class App:
         # State
         self.signal: Optional[StandardSignal] = None
         self.scale = ViewScale(volts_per_div=1.0, secs_per_div=0.01, v_offset=0.0)
-        #self.mode = "auto"  # "auto","sine","square","triangle"
-        #self.detected_label = "Unknown (0%)"
+        self.mode = "auto"  # "auto","sine","square","triangle"
+        self.detected_label = "Unknown (0%)"
         self.current_file: Optional[str] = None
         self.live_on = False
 
@@ -1434,40 +1326,37 @@ class App:
         self.SIDEBAR_W = 280
         self._layout()
 
-
+        # UI widgets
+        self.buttons: List["Button"] = []
+        self._build_ui()
 
         # Zoom and scroll
         self.spec_scale: SpectrumScale = SpectrumScale(hz_per_div=1000.0, f_start=0.0)
         self._spec_fmax = 0.0
         self.pending_spec_autocal = True
 
-
-        # UI widgets
-        self.buttons: List["Button"] = []
-        self._build_ui()
-
     def _layout(self):
-        """Compute rectangles for the left sidebar and right plots."""
+        """Compute static rectangles for the left sidebar and right plots."""
         PAD = self.PAD
         self.sidebar = pygame.Rect(PAD, PAD, self.SIDEBAR_W, HEIGHT - 2 * PAD)
 
-        # Panel heights (tuned to fit content)
+        # Panel heights
+        load_h = 160
+        select_h = 190
+        cal_h = 96  # ↑ taller so the button sits comfortably inside the panel
 
-        load_h = 165
-        scale_h = 150
-        cal_h = 96
-        stats_h = 200  # ↓ smaller stats
+        # Use the same small gap between *all* vertical panels
         PANEL_GAP = 10
 
         # Panels (top→bottom)
         self.panel_load = pygame.Rect(self.sidebar.x, self.sidebar.y, self.sidebar.w, load_h)
-        self.panel_scale = pygame.Rect(self.sidebar.x, self.panel_load.bottom + PANEL_GAP, self.sidebar.w, scale_h)
-        self.panel_stats = pygame.Rect(self.sidebar.x, self.panel_scale.bottom + PANEL_GAP, self.sidebar.w, stats_h)
+        self.panel_select = pygame.Rect(self.sidebar.x, self.panel_load.bottom + PANEL_GAP, self.sidebar.w, select_h)
+        self.panel_cal = pygame.Rect(self.sidebar.x, self.sidebar.bottom - cal_h, self.sidebar.w, cal_h)
 
-        # Calibration now takes the remaining space (expanded)
-        cal_top = self.panel_stats.bottom + PANEL_GAP
-        cal_h = self.sidebar.bottom - cal_top
-        self.panel_cal = pygame.Rect(self.sidebar.x, cal_top, self.sidebar.w, cal_h)
+        # Statistics fills between select and calibration with the SAME gap on both sides
+        stats_top = self.panel_select.bottom + PANEL_GAP
+        stats_h = (self.panel_cal.y - PANEL_GAP) - stats_top
+        self.panel_stats = pygame.Rect(self.sidebar.x, stats_top, self.sidebar.w, stats_h)
 
         # Right side plots (split view)
         right_x = self.sidebar.right + PAD
@@ -1480,13 +1369,12 @@ class App:
 
     def _build_ui(self):
         PAD = 12
-        BTN_H = 30
-        BTN_SP = 6
-        self.buttons = []  # rebuild
+        BTN_H = 30  # unified button height (smaller)
+        BTN_SP = 6  # unified vertical spacing
 
-        # --- Load signal ---
+        # --- Load signal panel ---
         x = self.panel_load.x + PAD
-        y = self.panel_load.y + 36
+        y = self.panel_load.y + 36  # title area
         bw = self.panel_load.w - 2 * PAD
 
         def add_here(label, cb, toggle=False):
@@ -1500,59 +1388,39 @@ class App:
         self.btn_live = add_here("Live capture", self.on_toggle_live, toggle=True)
         self.btn_live.active = False
 
-        # --- Scale (Volts/Div, Sec/Div, dB/Div) ---
-        def row_controls(panel, y0, label, on_minus, on_plus, get_value):
-            x = panel.x + PAD
-            bw = panel.w - 2 * PAD
-            # left/right thirds for - [value] +
-            w_btn = 40
-            w_val = bw - 2 * w_btn - 10
-            # label
-            lab_surface = self.font_small.render(label, True, TEXT)
-            self.screen  # (no-op to hint pyg to keep font ready)
-            # buttons
-            minus_btn = Button((x, y0, w_btn, BTN_H), "–", lambda b: on_minus(), toggle=False)
-            val_btn = Button((x + w_btn + 5, y0, w_val, BTN_H), get_value(), lambda b: None, toggle=False)
-            plus_btn = Button((x + w_btn + 5 + w_val + 5, y0, w_btn, BTN_H), "+", lambda b: on_plus(), toggle=False)
-            # store a small updater for the center label (we re-render each frame)
-            minus_btn._value_getter = None
-            val_btn._value_getter = get_value
-            plus_btn._value_getter = None
-            self.buttons.extend([minus_btn, val_btn, plus_btn])
-            return y0 + BTN_H + BTN_SP
+        # --- Signal select panel (same button size) ---
+        x = self.panel_select.x + PAD
+        y = self.panel_select.y + 36
+        bw = self.panel_select.w - 2 * PAD
 
-        y = self.panel_scale.y + 36
 
-        def v_get(): return f"{self.scale.volts_per_div:.3g} V/div"
-
-        def t_get(): return f"{self.scale.secs_per_div:.3g} s/div"
-
-        def d_get(): return f"{self.spec_scale.db_per_div:.3g} dB/div"
-
-        y = row_controls(self.panel_scale, y,
-                         "Volts/Div",
-                         lambda: self._nudge_vdiv(-1),
-                         lambda: self._nudge_vdiv(+1),
-                         v_get)
-        y = row_controls(self.panel_scale, y,
-                         "Sec/Div",
-                         lambda: self._nudge_tdiv(-1),
-                         lambda: self._nudge_tdiv(+1),
-                         t_get)
-        y = row_controls(self.panel_scale, y,
-                         "dB/Div",
-                         lambda: self._nudge_dbdiv(-1),
-                         lambda: self._nudge_dbdiv(+1),
-                         d_get)
-
-        # --- Calibration ---
+        """
+        self.btn_square = Button((x, y, bw, BTN_H), "Square", lambda b: self.set_mode("square"), toggle=True);
+        y += BTN_H + BTN_SP
+        self.btn_triangle = Button((x, y, bw, BTN_H), "Triangle", lambda b: self.set_mode("triangle"), toggle=True);
+        y += BTN_H + BTN_SP
+        self.btn_sine = Button((x, y, bw, BTN_H), "Sine", lambda b: self.set_mode("sine"), toggle=True);
+        y += BTN_H + BTN_SP
+        self.btn_auto = Button((x, y, bw, BTN_H), "Auto", lambda b: self.set_mode("auto"), toggle=True)
+        
+        self.buttons += [self.btn_square, self.btn_triangle, self.btn_sine, self.btn_auto]
+        self._sync_mode_buttons()
+        """
+        # --- Calibration panel (same button size; comfortably inside the panel) ---
         x = self.panel_cal.x + PAD
-        # leave space for one line of helper text under the title
-        y = self.panel_cal.y + 36 + 30  # ← was +12 / +something; now +30
+        y = self.panel_cal.y + 36 + 12  # a little breathing room under the title
         bw = self.panel_cal.w - 2 * PAD
         self.buttons.append(Button((x, y, bw, BTN_H), "Auto calibrate", self.on_auto_cal, toggle=True))
 
+    def set_mode(self, m: str):
+        self.mode = m
+        self._sync_mode_buttons()
 
+    def _sync_mode_buttons(self):
+        for b in (self.btn_auto, self.btn_sine, self.btn_square, self.btn_triangle):
+            b.active = False
+        {"auto": self.btn_auto, "sine": self.btn_sine,
+         "square": self.btn_square, "triangle": self.btn_triangle}[self.mode].active = True
 
 
 
@@ -1622,50 +1490,7 @@ class App:
         elif self.plot_fft.collidepoint(*pos):
             self._zoom_freq(pos, event.y, shift)
 
-    def _nudge_vdiv(self, step):
-        # 1/2/5 progression around current value
-        v = max(self.scale.volts_per_div, 1e-12)
-        base = [1, 2, 5]
-        # find decade & index
-        import math
-        exp = int(math.floor(math.log10(v)))
-        mant = v / (10 ** exp)
-        idx = min(range(3), key=lambda i: abs(mant - base[i]))
-        idx += step
-        while idx < 0:
-            idx += 3;
-            exp -= 1
-        while idx > 2:
-            idx -= 3;
-            exp += 1
-        self.scale.volts_per_div = base[idx] * (10 ** exp)
 
-    def _nudge_tdiv(self, step):
-        # same 1/2/5 progression
-        v = max(self.scale.secs_per_div, 1e-12)
-        import math
-        base = [1, 2, 5]
-        exp = int(math.floor(math.log10(v)))
-        mant = v / (10 ** exp)
-        idx = min(range(3), key=lambda i: abs(mant - base[i]))
-        idx += step
-        while idx < 0:
-            idx += 3;
-            exp -= 1
-        while idx > 2:
-            idx -= 3;
-            exp += 1
-        self.scale.secs_per_div = base[idx] * (10 ** exp)
-        # keep window anchored at the tail
-        ensure_visible_window(self.signal, self.scale) if self.signal else None
-
-    def _nudge_dbdiv(self, step):
-        # clamp between 2 dB/div and 20 dB/div
-        cur = float(self.spec_scale.db_per_div)
-        steps = [2, 3, 5, 10, 15, 20]
-        i = min(range(len(steps)), key=lambda k: abs(steps[k] - cur))
-        i = max(0, min(len(steps) - 1, i + step))
-        self.spec_scale.db_per_div = steps[i]
 
     # ---------- Actions ----------
     def on_load_csv(self, _=None):
@@ -1747,9 +1572,19 @@ class App:
         f0 = estimate_fundamental(freqs, mag)
         vpp, vrms, dc = compute_basic_levels(sig.amplitude)
         thd = compute_thd(freqs, mag, f0)
-        duty = compute_duty_cycle(sig.amplitude)
-        skew = compute_triangle_skew(sig.amplitude)
 
+        # Auto-detect (with label) unless user forced a mode
+        label = self.detected_label
+        effective_mode = self.mode
+        if self.mode == "auto":
+            lbl, conf = classify_waveform(freqs, mag, sig.amplitude)
+            label = f"{lbl} ({conf})"
+            effective_mode = lbl.lower() if lbl in ("Sine", "Square", "Triangle") else "auto"
+
+        # Conditional metrics
+
+        duty = compute_duty_cycle(sig.amplitude) if effective_mode == "square" else None
+        skew = compute_triangle_skew(sig.amplitude) if effective_mode == "triangle" else None
 
         return AnalysisMetrics(
             f0_hz=f0,
@@ -1759,8 +1594,8 @@ class App:
             dc=dc,
             duty_percent=duty,
             triangle_skew_percent=skew,
-            #mode=self.mode,
-            #detected_label=label
+            mode=self.mode,
+            detected_label=label
         )
 
     # ---------- Main loop ----------
@@ -1768,7 +1603,7 @@ class App:
     def run(self):
         running = True
         last_ana = 0.0
-        metrics = AnalysisMetrics(None, None, None, None, None, None, None)
+        metrics = AnalysisMetrics(None, None, None, None, None, None, None, "auto", "Unknown (0%)")
         cached_fft = (np.array([]), np.array([]))
 
         while running:
@@ -1798,7 +1633,7 @@ class App:
             if self.signal and (now - last_ana) > 0.1:
                 metrics = self.analyze(self.signal)
                 cached_fft = compute_fft(self.signal)
-                #self.detected_label = metrics.detected_label
+                self.detected_label = metrics.detected_label
                 last_ana = now
 
             # Spectrum viewport maintenance
@@ -1819,37 +1654,24 @@ class App:
             # --- Clear ---
             self.screen.fill(BG)
 
-
             # --- Panels & titles ---
-            draw_titled_panel(self.screen, self.panel_load, "Load signal", self.font)
-            draw_titled_panel(self.screen, self.panel_scale, "Scale", self.font)
+            #draw_titled_panel(self.screen, self.panel_load, "Load signal", self.font)
+            draw_titled_panel(self.screen, self.panel_select, "Signal select", self.font)
             draw_titled_panel(self.screen, self.panel_stats, "Statistics", self.font)
             draw_titled_panel(self.screen, self.panel_cal, "Calibration", self.font)
 
-            # --- Calibration helper text ---
-            cal_msg = "Input 1Vpp signal at 1kHz"
-            self.screen.blit(self.font_small.render(cal_msg, True, TEXT),
-                             (self.panel_cal.x + 12, self.panel_cal.y + 36))
-
-            # --- Load status text ---
+            # --- Panel content: Load signal status text ---
             sx = self.panel_load.x + 12
-            sy = self.panel_load.y + 36 + 2 * 34 + 10
+            sy = self.panel_load.y + 36 + 2 * 34 + 10  # under the two buttons
             curr = f"Current file: {self.current_file if self.current_file else '—'}"
             stat = f"Status: {'On' if self.live_on else 'Off'}"
             self.screen.blit(self.font_small.render(curr, True, TEXT), (sx, sy));
             sy += 22
             self.screen.blit(self.font_small.render(stat, True, TEXT), (sx, sy))
 
-            # --- Refresh the center labels of the three scale rows (value buttons) ---
-            for b in self.buttons:
-                if hasattr(b, "_value_getter") and b._value_getter:
-                    # re-render the value text each frame
-                    b.label = b._value_getter()
-
-            # --- Draw buttons last so they sit above panels ---
+            # --- Draw the buttons last so they sit above panel backgrounds ---
             for b in self.buttons:
                 b.draw(self.screen, self.font_small)
-
 
             # --- Right-side plots ---
             if self.signal:
@@ -1861,13 +1683,9 @@ class App:
                 draw_spectrum(self.screen, self.plot_fft, freqs, mag, metrics.f0_hz, self.font_small, self.spec_scale)
 
 
-
             else:
-                # Draw empty plots using the new header/body + lighter grid
-                draw_waveform(self.screen, self.plot_time, None, self.scale, self.font_small)
-                draw_spectrum(self.screen, self.plot_fft, np.array([]), np.array([]),
-
-                              None, self.font_small, self.spec_scale)
+                draw_grid(self.screen, self.plot_time)
+                draw_grid(self.screen, self.plot_fft)
 
             # --- Statistics content (inside stats panel) ---
             stats_x = self.panel_stats.x + 12
@@ -1900,3 +1718,16 @@ if __name__ == "__main__":
         print("Fatal error:", e)
         pygame.quit()
         sys.exit(1)
+
+
+
+"""
+
+   # Panel heights
+        load_h = 165
+        scale_h = 150
+        cal_h = 96
+        PANEL_GAP = 10
+
+
+"""
