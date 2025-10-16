@@ -42,7 +42,7 @@ pri_once = True
 
 # --------------------------------------- Block 2 : Config & constants ------------------------------------------#
 
-WIDTH, HEIGHT = 1200, 700
+WIDTH, HEIGHT = 1200, 750
 FPS = 60
 
 # Plot areas (split view)
@@ -488,8 +488,10 @@ class AudioStream:
         self.idx = 0
         self.running = False
         self.stream = None
+        self.device = None  # selected PortAudio device index or name
 
     def _callback(self, indata, frames, time_info, status):
+        # keep the original callback body
         if status:
             # You can print status if debugging
             pass
@@ -512,14 +514,23 @@ class AudioStream:
         if self.running:
             return
         self.running = True
-        self.stream = sd.InputStream(
-            channels=self.channels,
-            samplerate=self.fs,
-            blocksize=AUDIO_BLOCK,
-            callback=self._callback,
-            dtype='float32'
-        )
-        self.stream.start()
+        try:
+            kwargs = {}
+            if self.device is not None:
+                kwargs["device"] = self.device
+            self.stream = sd.InputStream(
+                channels=self.channels,
+                samplerate=self.fs,
+                blocksize=AUDIO_BLOCK,
+                callback=self._callback,  # <- IMPORTANT: matches method name above
+                dtype='float32',
+                **kwargs
+            )
+            self.stream.start()
+        except Exception as e:
+            self.running = False
+            self.stream = None
+            messagebox.showerror("Audio Error", str(e))
 
     def stop(self):
         self.running = False
@@ -529,6 +540,18 @@ class AudioStream:
                 self.stream.close()
         finally:
             self.stream = None
+
+    def set_device(self, device):
+        """
+        Set input device (PortAudio index or name). If running, restart the stream.
+        """
+        self.device = device
+        if self.running:
+            try:
+                self.stop()
+                self.start()
+            except Exception as e:
+                messagebox.showerror("Audio Error", f"Could not switch device:\n{e}")
 
     def snapshot(self, window_sec: float = 0.2) -> Optional[StandardSignal]:
         if not self.running:
@@ -545,6 +568,35 @@ class AudioStream:
                 y = np.concatenate([self.ring[start:], self.ring[:end]]).copy()
         t = np.arange(len(y)) / float(self.fs)
         return StandardSignal(time=t, amplitude=y.astype(np.float64), sampling_rate=float(self.fs), source="audio")
+
+
+
+def list_audio_input_devices():
+    """
+    Return a list of input-capable devices as dicts:
+    [{'index': int, 'name': str, 'max_input_channels': int, 'default_samplerate': float|None}, ...]
+    Empty list if sounddevice isn't available or nothing was found.
+    """
+    if not HAVE_SD:
+        return []
+    try:
+        devs = sd.query_devices()
+    except Exception:
+        return []
+    out = []
+    for i, d in enumerate(devs):
+        try:
+            if int(d.get("max_input_channels", 0)) > 0:
+                out.append({
+                    "index": i,
+                    "name": d.get("name", f"Device {i}"),
+                    "max_input_channels": int(d.get("max_input_channels", 0)),
+                    "default_samplerate": float(d.get("default_samplerate", 0.0)) if d.get("default_samplerate") else None
+                })
+        except Exception:
+            continue
+    return out
+
 
 # --------------------------------------- Block 5 : End ------------------------------------------#
 
@@ -777,6 +829,111 @@ def classify_waveform(freqs: np.ndarray, mag: np.ndarray, y: np.ndarray) -> Tupl
         return "Triangle", "65%"
 
     return "Unknown", "50%"
+
+
+def find_trigger_point(y: np.ndarray, threshold: float = 0.0) -> Optional[int]:
+    """
+    Find the index of the first upward (rising) zero-crossing near the center of the signal.
+    Returns sample index or None.
+    """
+    if y.size < 4:
+        return None
+    y = np.asarray(y)
+    # Center the data roughly
+    y -= np.mean(y)
+    above = y >= threshold
+    crossings = np.where(np.diff(above.astype(np.int8)) == 1)[0]
+    if crossings.size == 0:
+        return None
+    # Choose the crossing nearest the middle of the signal
+    mid = len(y) // 2
+    idx = crossings[np.argmin(np.abs(crossings - mid))]
+    return int(idx)
+
+
+def rising_zero_cross_times(y: np.ndarray, fs: float, level: float = 0.0) -> np.ndarray:
+    """
+    Return sub-sample times (seconds) of rising crossings through 'level'.
+    """
+    if y.size < 4 or fs <= 0:
+        return np.array([])
+    y = np.asarray(y, float)
+    y = y - np.mean(y)  # center to reduce bias
+    above = y >= level
+    edges = np.where(np.diff(above.astype(np.int8)) == 1)[0]
+    if edges.size == 0:
+        return np.array([])
+    # linear interpolation per edge
+    y0 = y[edges]
+    y1 = y[edges + 1]
+    frac = np.where(y1 != y0, (level - y0) / (y1 - y0), 0.0)
+    t = (edges + frac) / fs
+    return t
+
+
+def snap_phase(t_raw: float, t_ref: float, period: Optional[float]) -> float:
+    """
+    Snap 't_raw' near 't_ref' by adding/subtracting integer multiples of 'period'.
+    Keeps the phase consistent across frames.
+    """
+    if not period or period <= 0 or not np.isfinite(period):
+        return t_raw
+    k = round((t_ref - t_raw) / period)
+    return t_raw + k * period
+
+
+def rising_zero_cross_index(y: np.ndarray, level: float = 0.0) -> Optional[float]:
+    """
+    Sub-sample index (can be fractional) of a rising crossing near the middle.
+    Returns None if not found.
+    """
+    if y.size < 4:
+        return None
+    x = y.astype(float) - np.mean(y)
+    above = x >= level
+    edges = np.where(np.diff(above.astype(np.int8)) == 1)[0]
+    if edges.size == 0:
+        return None
+    mid = x.size // 2
+    i = int(edges[np.argmin(np.abs(edges - mid))])
+    y0, y1 = x[i], x[i+1]
+    frac = 0.0 if y1 == y0 else (level - y0) / (y1 - y0)   # 0..1
+    return float(i + frac)
+
+
+def center_on_trigger(y: np.ndarray, fs: float) -> Tuple[np.ndarray, float]:
+    """
+    Return (y_aligned, frac_center_idx) where y is circularly rolled so the
+    chosen rising crossing sits at the center sample. Also returns the
+    *fractional* index of that center (for time offset).
+    """
+    n = y.size
+    if n < 4 or fs <= 0:
+        return y, (n - 1) / 2.0
+    idx = rising_zero_cross_index(y, 0.0)
+    if idx is None:
+        return y, (n - 1) / 2.0
+    c = (n - 1) / 2.0                      # desired center index (fractional)
+    shift = int(round(c - idx))            # integer roll to put crossing at center
+    y2 = np.roll(y, shift)
+    # fractional residual after integer roll
+    frac_center = idx + shift
+    return y2, float(frac_center)
+
+def _safe_vpp(y: np.ndarray) -> Optional[float]:
+    """
+    Safely compute the peak-to-peak voltage of a signal array.
+    Returns None if invalid or empty.
+    """
+    if y is None or len(y) < 2:
+        return None
+    y = np.asarray(y, dtype=float)
+    if not np.isfinite(y).any():
+        return None
+    v = float(np.nanmax(y) - np.nanmin(y))
+    return v if np.isfinite(v) else None
+
+
 # --------------------------------------- Block 6 : End ------------------------------------------#
 
 
@@ -910,6 +1067,19 @@ def ensure_visible_window(signal: StandardSignal, scale: ViewScale) -> None:
     scale.secs_per_div = max(span / 10.0, 1e-12)
     scale.t_start = max(t_data0, t_data1 - span)
 
+def refit_vertical_to_signal(signal: StandardSignal, scale: "ViewScale", fit_margin: float = 0.90) -> None:
+    """
+    Recompute only volts/div and v_offset to fit the current signal vertically.
+    Does NOT change secs_per_div or t_start.
+    """
+    if signal is None or signal.amplitude is None or len(signal.amplitude) < 2:
+        return
+    y = np.asarray(signal.amplitude, dtype=float)
+    y_max = float(np.nanmax(y))
+    y_min = float(np.nanmin(y))
+    vpp = max(y_max - y_min, 1e-12)
+    scale.volts_per_div = (vpp / max(fit_margin, 1e-6)) / 6.0
+    scale.v_offset = 0.5 * (y_max + y_min)
 
 
 def ensure_visible_freq_window(scale: SpectrumScale, f_max: float) -> None:
@@ -1407,6 +1577,7 @@ def draw_titled_panel(surf, rect: pygame.Rect, title: str, font):
 # --------------------------------------- Block 9 : App ------------------------------------------#
 
 
+
 class App:
 
     def __init__(self):
@@ -1418,6 +1589,8 @@ class App:
         self.font_small = pygame.font.SysFont("consolas", 16)
         self.pending_autocal = False  # one-shot autoscale when source changes
 
+
+
         # State
         self.signal: Optional[StandardSignal] = None
         self.scale = ViewScale(volts_per_div=1.0, secs_per_div=0.01, v_offset=0.0)
@@ -1428,6 +1601,29 @@ class App:
 
         # Audio
         self.audio = AudioStream(SAMPLE_RATE, 1)
+        # Audio devices
+        self.audio_devices = list_audio_input_devices() if HAVE_SD else []
+        # Pick default input device (maps sounddevice default -> our list index)
+        self.selected_dev_idx = None
+        if HAVE_SD and self.audio_devices:
+            try:
+                default_in = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
+            except Exception:
+                default_in = None
+            # map default_in (int) to index in our filtered list
+            if isinstance(default_in, int):
+                for i, d in enumerate(self.audio_devices):
+                    if d["index"] == default_in:
+                        self.selected_dev_idx = i
+                        break
+        # If no default matched, just use the first
+        if self.selected_dev_idx is None and self.audio_devices:
+            self.selected_dev_idx = 0
+        # Apply to AudioStream instance
+        if self.selected_dev_idx is not None:
+            self.audio.set_device(self.audio_devices[self.selected_dev_idx]["index"])
+
+
 
         # UI layout
         self.PAD = 16
@@ -1442,6 +1638,44 @@ class App:
         self.pending_spec_autocal = True
 
 
+
+
+
+        # --- Trigger lock state (for live view) ---
+        self._trig_t_smooth = None   # smoothed trigger time within the snapshot (sec)
+        self._trig_period   = None   # estimated period (sec)
+        self._trig_alpha    = 0.12   # smoothing factor (0..1) smaller = steadier
+
+
+        # ---- Live input calibration (amplitude) — session only ----
+        self.cal_gain = 1.0              # gain applied to live samples
+        self.cal_active = False          # collecting calibration frames?
+        self.cal_target_vpp = 1.0       # we expect 1 Vpp during calibration
+        self.cal_ref_freq = 1000.0       # Hz reference tone
+        self.cal_tol = 0.1              #  tolerance on frequency
+        self.cal_collect_frames = 8      # frames to average
+        self._cal_vpps = []              # Vpp samples collected this session
+        self._cal_last_msg = "Idle"
+
+        # Enough frames? compute new gain
+        if len(self._cal_vpps) >= self.cal_collect_frames:
+            med_vpp = float(np.median(self._cal_vpps))
+            if med_vpp > 1e-12:
+                # Target 1.0 Vpp; current display Vpp = med_vpp
+                self.cal_gain = float(np.clip(self.cal_target_vpp / med_vpp, 0.01, 100.0))
+                self._cal_last_msg = f"Done: Vpp≈{med_vpp:.3f} V → gain x{self.cal_gain:.3f}"
+
+                # >>> NEW: re-fit vertical axis to the (now scaled) live signal
+                if self.signal is not None:
+                    refit_vertical_to_signal(self.signal, self.scale, fit_margin=0.92)
+            else:
+                self._cal_last_msg = "Failed: Vpp too small"
+            # Stop calibration…
+            self.cal_active = False
+            self._cal_vpps.clear()
+            if hasattr(self, "btn_input_cal"):
+                self.btn_input_cal.active = False
+
         # UI widgets
         self.buttons: List["Button"] = []
         self._build_ui()
@@ -1452,11 +1686,9 @@ class App:
         self.sidebar = pygame.Rect(PAD, PAD, self.SIDEBAR_W, HEIGHT - 2 * PAD)
 
         # Panel heights (tuned to fit content)
-
-        load_h = 165
+        load_h = 205     # ← includes room for Choose file, Live capture, and device selector
         scale_h = 150
-        cal_h = 96
-        stats_h = 200  # ↓ smaller stats
+        stats_h = 200
         PANEL_GAP = 10
 
         # Panels (top→bottom)
@@ -1464,17 +1696,18 @@ class App:
         self.panel_scale = pygame.Rect(self.sidebar.x, self.panel_load.bottom + PANEL_GAP, self.sidebar.w, scale_h)
         self.panel_stats = pygame.Rect(self.sidebar.x, self.panel_scale.bottom + PANEL_GAP, self.sidebar.w, stats_h)
 
-        # Calibration now takes the remaining space (expanded)
+        # Calibration now fills the rest
         cal_top = self.panel_stats.bottom + PANEL_GAP
         cal_h = self.sidebar.bottom - cal_top
         self.panel_cal = pygame.Rect(self.sidebar.x, cal_top, self.sidebar.w, cal_h)
 
-        # Right side plots (split view)
+        # Right-side plots (split view)
         right_x = self.sidebar.right + PAD
         content_w = WIDTH - right_x - PAD
         plot_h = (HEIGHT - 2 * PAD - MID_GAP) // 2
         self.plot_time = pygame.Rect(right_x, PAD, content_w, plot_h)
         self.plot_fft = pygame.Rect(right_x, PAD + plot_h + MID_GAP, content_w, plot_h)
+
 
     # ---------- UI ----------
 
@@ -1547,12 +1780,46 @@ class App:
 
         # --- Calibration ---
         x = self.panel_cal.x + PAD
-        # leave space for one line of helper text under the title
-        y = self.panel_cal.y + 36 + 30  # ← was +12 / +something; now +30
+        y = self.panel_cal.y + 36 + 30
         bw = self.panel_cal.w - 2 * PAD
-        self.buttons.append(Button((x, y, bw, BTN_H), "Auto calibrate", self.on_auto_cal, toggle=True))
 
+        # Single button that does amplitude cal (live) or view autoscale (CSV)
+        self.btn_cal = Button((x, y, bw, BTN_H), "Calibrate", self.on_calibrate, toggle=True)
+        self.buttons.append(self.btn_cal)
 
+        # --- Device selector row (inside Load signal panel) ---
+        if HAVE_SD:
+            # Absolute position in the Load panel, below the two buttons
+            dev_x  = self.panel_load.x + PAD
+            dev_y  = self.panel_load.y + 36 + 2 * (BTN_H + BTN_SP)  # after "Choose file" + "Live capture"
+            dev_bw = self.panel_load.w - 2 * PAD
+
+            w_btn = 40
+            w_val = dev_bw - 2 * w_btn - 10
+
+            def _prev_dev(_=None):
+                if not self.audio_devices:
+                    return
+                self.selected_dev_idx = (self.selected_dev_idx - 1) % len(self.audio_devices)
+                self._apply_selected_device()
+
+            def _next_dev(_=None):
+                if not self.audio_devices:
+                    return
+                self.selected_dev_idx = (self.selected_dev_idx + 1) % len(self.audio_devices)
+                self._apply_selected_device()
+
+            def _dev_label():
+                if not self.audio_devices or self.selected_dev_idx is None:
+                    return "No input devices"
+                name = self.audio_devices[self.selected_dev_idx]["name"]
+                return (name[:28] + "…") if len(name) > 30 else name
+
+            btn_prev = Button((dev_x, dev_y, w_btn, BTN_H), "◀", lambda b: _prev_dev())
+            btn_val  = Button((dev_x + w_btn + 5, dev_y, w_val, BTN_H), _dev_label(), lambda b: None)
+            btn_next = Button((dev_x + w_btn + 5 + w_val + 5, dev_y, w_btn, BTN_H), "▶", lambda b: _next_dev())
+            btn_val._value_getter = _dev_label
+            self.buttons.extend([btn_prev, btn_val, btn_next])
 
 
 
@@ -1721,8 +1988,34 @@ class App:
         if btn.active:
             # Start live capture
             try:
+
+                # Ensure stream uses the currently selected device
+                if HAVE_SD and self.audio_devices and self.selected_dev_idx is not None:
+                    self.audio.set_device(self.audio_devices[self.selected_dev_idx]["index"])
+
+                # Session-only: start from unity gain each live session
+                self.cal_gain = 1.0
+                self._cal_last_msg = "Live started → gain reset (x1.000)."
+                self._cal_vpps.clear()
+                self.cal_active = False
+                if hasattr(self, "btn_input_cal"):
+                    self.btn_input_cal.active = False
+                else:
+                    self.audio.stop()
+                    self.live_on = False
+                    self._cal_last_msg = "Live off."
+                    self._cal_vpps.clear()
+                    self.cal_active = False
+                    self.cal_gain = 1.0
+                    if hasattr(self, "btn_input_cal"):
+                        self.btn_input_cal.active = False
+
                 self.audio.start()
                 self.live_on = True
+
+                if self.signal is not None:
+                    refit_vertical_to_signal(self.signal, self.scale, fit_margin=0.92)
+
                 self.current_file = None
                 self.pending_autocal = True  # autoscale on first audio frame
                 self.pending_spec_autocal = True
@@ -1763,6 +2056,54 @@ class App:
             #detected_label=label
         )
 
+    def _apply_selected_device(self):
+        if not (HAVE_SD and self.audio_devices and self.selected_dev_idx is not None):
+            return
+        try:
+            dev_pa_index = self.audio_devices[self.selected_dev_idx]["index"]
+            self.audio.set_device(dev_pa_index)
+            # Session-only: reset gain when device changes
+            self.cal_gain = 1.0
+            self._cal_last_msg = "Device changed → gain reset (x1.000). Press Calibrate input."
+            self._cal_vpps.clear()
+            self.cal_active = False
+            if hasattr(self, "btn_input_cal"):
+                self.btn_input_cal.active = False
+        except Exception as e:
+            messagebox.showerror("Audio Error", f"Failed to set input device:\n{e}")
+
+    def on_calibrate(self, btn: "Button"):
+        """
+        Unified Calibrate button:
+          - Live ON  -> start/stop amplitude calibration (expects 1 Vpp @ 1 kHz)
+                        and immediately refits the vertical axis.
+          - Live OFF -> autoscale the view (no gain change).
+        """
+        if self.live_on:
+            # --- LIVE MODE ---
+            if btn.active:
+                self._cal_vpps.clear()
+                self.cal_active = True
+                self._cal_last_msg = "Collecting… (need 1 kHz @ 1 Vpp)"
+            else:
+                self.cal_active = False
+                self._cal_vpps.clear()
+                self._cal_last_msg = "Cancelled"
+
+            if self.signal is not None:
+                refit_vertical_to_signal(self.signal, self.scale, fit_margin=0.92)
+                ensure_visible_window(self.signal, self.scale)
+
+            pygame.event.post(pygame.event.Event(pygame.USEREVENT, {"update": True}))
+
+        else:
+            # --- STATIC/CSV MODE ---
+            if self.signal is None:
+                self._cal_last_msg = "No data"
+            else:
+                # Fit both axes for the loaded signal
+                self.scale = auto_calibrate(self.signal, self.plot_time)
+
     # ---------- Main loop ----------
 
     def run(self):
@@ -1781,13 +2122,66 @@ class App:
                         b.handle(event)
                 elif event.type == pygame.MOUSEWHEEL:
                     self._handle_wheel(event)
-            # Stream snapshot if live
+
             if self.live_on:
-                sig = self.audio.snapshot(0.2)
+                sig = self.audio.snapshot(0.25)
                 if sig is not None:
-                    # Normalize time for the rolling window
-                    sig.time = np.arange(len(sig.amplitude)) / sig.sampling_rate
+                    fs = float(sig.sampling_rate)
+                    y = sig.amplitude.astype(np.float64, copy=False)
+
+                    # 1) Phase-lock/center (you already added this)
+                    y_aligned, _ = center_on_trigger(y, fs)
+                    n = len(y_aligned);
+                    c = (n - 1) / 2.0
+                    t = (np.arange(n, dtype=np.float64) - c) / fs
+
+                    # 2) APPLY CURRENT CALIBRATION GAIN
+                    y_aligned = y_aligned * float(self.cal_gain)
+
+                    # 3) Update signal + keep window centered
+                    sig.amplitude = y_aligned
+                    sig.time = t
+                    span = 10.0 * max(self.scale.secs_per_div, 1e-12)
+                    self.scale.t_start = -span * 0.5
                     self.signal = sig
+
+                    # 4) If the Calibrate button is active, collect frames and compute gain
+                    if self.cal_active:
+                        # Estimate frequency to gate around 1 kHz
+                        if 'estimate_fundamental_robust' in globals():
+                            f_est = estimate_fundamental_robust(sig)
+                        else:
+                            freqs_tmp, mag_tmp = compute_fft(sig)
+                            f_est = estimate_fundamental(freqs_tmp, mag_tmp)
+
+                        ok_freq = (f_est is not None and abs(
+                            f_est - self.cal_ref_freq) <= self.cal_tol * self.cal_ref_freq)
+
+                        vpp = _safe_vpp(y_aligned)  # includes current gain (starts at 1.0)
+                        if ok_freq and vpp is not None and vpp > 1e-9:
+                            self._cal_vpps.append(vpp)
+                            self._cal_last_msg = f"Collecting… {len(self._cal_vpps)}/{self.cal_collect_frames} (Vpp≈{vpp:.3f} V)"
+                        else:
+                            self._cal_last_msg = "Waiting for 1 kHz @ 1 Vpp…"
+
+                        # Enough good frames? finalize gain
+                        if len(self._cal_vpps) >= self.cal_collect_frames:
+                            med_vpp = float(np.median(self._cal_vpps))
+                            if med_vpp > 1e-12:
+                                # We want 1.00 Vpp to read as 1.00 V
+                                self.cal_gain = float(np.clip(self.cal_target_vpp / med_vpp, 0.01, 100.0))
+                                self._cal_last_msg = f"Done: Vpp≈{med_vpp:.3f} V → gain x{self.cal_gain:.3f}"
+
+                                # Re-fit vertical axis to the (now scaled) live signal
+                                refit_vertical_to_signal(self.signal, self.scale, fit_margin=0.92)
+                            else:
+                                self._cal_last_msg = "Failed: Vpp too small"
+
+                            # Stop calibration and release the button
+                            self.cal_active = False
+                            self._cal_vpps.clear()
+                            if hasattr(self, "btn_cal"):
+                                self.btn_cal.active = False
 
             if self.pending_autocal and self.signal is not None:
                 self.scale = auto_calibrate(self.signal, self.plot_time)
@@ -1834,11 +2228,25 @@ class App:
             # --- Load status text ---
             sx = self.panel_load.x + 12
             sy = self.panel_load.y + 36 + 2 * 34 + 10
+
             curr = f"Current file: {self.current_file if self.current_file else '—'}"
             stat = f"Status: {'On' if self.live_on else 'Off'}"
-            self.screen.blit(self.font_small.render(curr, True, TEXT), (sx, sy));
-            sy += 22
-            self.screen.blit(self.font_small.render(stat, True, TEXT), (sx, sy))
+
+            # New: device line
+            if HAVE_SD and self.audio_devices and self.selected_dev_idx is not None:
+                dev_name = self.audio_devices[self.selected_dev_idx]['name']
+                # limit long device names
+                if len(dev_name) > 38:
+                    dev_name = dev_name[:38] + "…"
+                dev_line = f"Input: {dev_name}"
+            else:
+                dev_line = "Input: —"
+
+            # Draw the three lines
+            self.screen.blit(self.font_small.render(curr, True, TEXT), (sx, sy)); sy += 22
+            self.screen.blit(self.font_small.render(stat, True, TEXT), (sx, sy)); sy += 22
+            self.screen.blit(self.font_small.render(dev_line, True, TEXT), (sx, sy))
+
 
             # --- Refresh the center labels of the three scale rows (value buttons) ---
             for b in self.buttons:
